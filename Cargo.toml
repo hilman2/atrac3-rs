@@ -1,0 +1,16 @@
+[package]
+name = "atrac3-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.50", features = ["derive"] }
+hound = "3.5.1"
+tempfile = "3.23.0"
+rayon = "1.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
