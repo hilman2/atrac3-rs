@@ -998,33 +998,39 @@ fn build_spectral_unit_budgeted(
     }
 
     // POST-PROMOTION: use real bit costs to fill remaining slot capacity.
-    // Sony does this implicitly via bit-reservoir; we do it per-frame.
-    // Sort bands by perceptual importance (peak * width) and try to upgrade.
+    // Runs in multiple passes. Each pass walks the subbands in importance
+    // order and tries to upgrade the table index by one, if the real bit
+    // cost still fits in the remaining surplus. TZS and earlier upgrades
+    // can free additional bits that become available to later passes, so
+    // we iterate until no upgrade is found or surplus drops below a small
+    // floor.
     let mut surplus = target_bits.saturating_sub(used_bits);
-    if surplus > 30 {
+    for _pass in 0..4 {
+        if surplus < 20 { break; }
         let mut order: Vec<usize> = (0..quantized_subbands.len().min(num_active_bands))
             .filter(|&b| {
                 let t = quantized_subbands[b].table_index;
                 t > 0 && t < 7
             })
             .collect();
-        // Most important = highest peak in low-frequency bands first
+        // Most important = highest peak in low-frequency bands first.
         order.sort_by(|&a, &b| {
             let pa = band_peak_sf[a] as f32;
             let pb = band_peak_sf[b] as f32;
             pb.partial_cmp(&pa).unwrap()
         });
 
+        let mut upgrades_this_pass = 0usize;
         for &band in &order {
             if surplus < 20 { break; }
             let start = ATRAC3_SUBBAND_TAB[band];
             let end = ATRAC3_SUBBAND_TAB[band + 1];
             let slice = &coefficients[start..end];
             let cur_tbl = quantized_subbands[band].table_index;
+            if cur_tbl >= 7 { continue; }
             let new_tbl = cur_tbl + 1;
             let peak = slice.iter().map(|c| c.abs()).fold(0.0f32, f32::max);
             let sf_center = optimal_sf_index_for_peak(peak, new_tbl);
-            // Try sf_center ±2 to find best upgrade that fits
             let mut best_upgrade: Option<QuantizedSubband> = None;
             let mut best_score = quantized_subbands[band].mse;
             for delta in -2i8..=2 {
@@ -1041,7 +1047,7 @@ fn build_spectral_unit_budgeted(
             if let Some(upgraded) = best_upgrade {
                 let extra = candidate_total_bits(&upgraded)
                     .saturating_sub(candidate_total_bits(&quantized_subbands[band]));
-                surplus -= extra;
+                surplus = surplus.saturating_sub(extra);
                 used_bits += extra;
                 let recon = upgraded.dequantized(end - start)?;
                 reconstructed[start..end].copy_from_slice(&recon);
@@ -1049,8 +1055,10 @@ fn build_spectral_unit_budgeted(
                     - quantized_subbands[band].payload_bits;
                 spectral_subbands[band] = upgraded.spectral_subband(coding_mode)?;
                 quantized_subbands[band] = upgraded;
+                upgrades_this_pass += 1;
             }
         }
+        if upgrades_this_pass == 0 { break; }
     }
 
     // Trim trailing uncoded
@@ -1089,16 +1097,38 @@ fn quantize_subband(
     let scale = scale_factor(scale_factor_index) * ATRAC3_INV_MAX_QUANT[selector as usize];
     ensure!(scale > 0.0, "selector {} has invalid scale", selector);
 
-    let mantissas = match (coding_mode, selector) {
+    let mut mantissas = match (coding_mode, selector) {
         (CodingMode::Clc, 1) => quantize_selector1_clc(coefficients, scale),
         (CodingMode::Vlc, 1) => quantize_selector1_vlc(coefficients, scale)?,
         (CodingMode::Clc, _) => quantize_signed_clc(coefficients, selector, scale),
         (CodingMode::Vlc, _) => quantize_vlc(coefficients, selector, scale)?,
     };
+
+    // Trailing-Zero-Stripping: if all mantissas are even (and at least one
+    // non-zero), halve them and add 3 to sfIndex. This is a mathematical
+    // identity because scale_factor(sf+3) = 2 * scale_factor(sf), so the
+    // dequantized values are bit-exact. The benefit is smaller absolute
+    // mantissa values, which compress to shorter VLC codes.
+    //
+    // Only applied for selectors >= 2 because selector 1 uses a pair VLC
+    // that depends on exact mantissa values, not just their scale.
+    let mut final_sf = scale_factor_index;
+    let mut final_scale = scale;
+    if selector >= 2 && !mantissas.is_empty() {
+        while final_sf <= 60 {
+            let any_odd = mantissas.iter().any(|&m| m & 1 != 0);
+            let any_nonzero = mantissas.iter().any(|&m| m != 0);
+            if any_odd || !any_nonzero { break; }
+            for m in &mut mantissas { *m /= 2; }
+            final_sf += 3;
+            final_scale = scale_factor(final_sf) * ATRAC3_INV_MAX_QUANT[selector as usize];
+        }
+    }
+
     let payload = encode_mantissas(selector, coding_mode, &mantissas)?;
     let reconstructed: Vec<f32> = mantissas
         .iter()
-        .map(|&mantissa| mantissa as f32 * scale)
+        .map(|&mantissa| mantissa as f32 * final_scale)
         .collect();
 
     // Track max-|error| per bin (worst-case selection criterion).
@@ -1108,7 +1138,7 @@ fn quantize_subband(
 
     Ok(QuantizedSubband {
         table_index: selector,
-        scale_factor_index: Some(scale_factor_index),
+        scale_factor_index: Some(final_sf),
         mantissas,
         payload_bits: payload.bit_len(),
         mse: mean_square(coefficients, &reconstructed),
