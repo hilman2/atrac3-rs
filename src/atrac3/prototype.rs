@@ -296,6 +296,7 @@ impl PrototypeEncoder {
             lambda: options.lambda,
             target_bits: options.target_bits_per_channel,
             max_candidates_per_band: 64,
+            tonal_marked_subbands: [false; 32],
         };
         let frames: Vec<PrototypeFrame> = all_analyses
             .par_iter()
@@ -398,6 +399,7 @@ impl PrototypeEncoder {
             let mut adjusted_search = search;
             adjusted_search.target_bits =
                 Some(spectral_budget.saturating_sub(tonal_result.tonal_bits));
+            adjusted_search.tonal_marked_subbands = tonal_result.tonal_subbands;
 
             let mut spectrum = build_spectral_unit(&residual, coding_mode, adjusted_search)?;
             pad_spectral_unit(&mut spectrum, min_subband_count);

@@ -54,6 +54,33 @@ const BASE_COST_SCALAR: [i32; 8] = [100, 15, 20, 25, 29, 35, 45, 55];
 /// sfIndex threshold offset per tblIndex (0 through 7).
 const SF_THRESHOLD_OFFSET: [i32; 8] = [55, 3, 5, 7, 9, 12, 15, 18];
 
+/// Frequency weighting for the LF-first overshoot reducer.
+/// When the spectral budget overflows, the allocator removes the overshoot
+/// in priority from the lower frequency bands, which sustain the highest
+/// energy and recover most gracefully from coarser quantization. The
+/// weights are taken from the reference encoder's overshoot pass and are
+/// expressed as Q8 fractions.
+///
+/// Index 0 is band 0, the lowest frequency. Bands not listed get the
+/// final weight, which lets the higher bands keep almost all of their
+/// allocation.
+const LF_OVERSHOOT_WEIGHTS_Q8: [i32; 18] = [
+    256, // band 0:  100% (1.000)
+    188, // band 1:  73%  (0xbc / 256)
+    97, 97, 97, 97, 97, 97, // bands 2-7:  38% (0x61 / 256)
+    74, 74, 74, 74, 74, 74, 74, 74, 74, 74, // bands 8-17: 29% (0x4a / 256)
+];
+
+/// Tonal-driven neighbour spread amplitudes.
+/// Indexed by `min((tbl_index - 1) >> 1, 4)`, this controls how strongly
+/// a band that contains an extracted tonal pulls quantization precision
+/// onto its neighbours. The values are negative because the reference
+/// encoder subtracts them from a "remaining-budget" score, so a smaller
+/// (more negative) value pulls more bits in. Higher tbl_index classes
+/// produce stronger spread because they correspond to coarser quantization
+/// where a pure tone leaves the most untreated noise around itself.
+const TONAL_SPREAD_Q0: [i32; 5] = [-225, -266, -307, -317, -1024];
+
 const ATRAC3_HUFF_TABS: [(u8, u8); 139] = [
     (31, 1),
     (32, 3),
@@ -291,6 +318,11 @@ pub struct SearchOptions {
     pub lambda: f32,
     pub target_bits: Option<usize>,
     pub max_candidates_per_band: usize,
+    /// One bit per subband (0..32). True if a tonal entry was extracted
+    /// from this subband. The budgeted allocator uses this mask to drive
+    /// the asymmetric upward neighbour spread that pulls quantization
+    /// precision into the bands above each tonal-marked subband.
+    pub tonal_marked_subbands: [bool; 32],
 }
 
 impl Default for SearchOptions {
@@ -299,6 +331,7 @@ impl Default for SearchOptions {
             lambda: 0.0001,
             target_bits: None,
             max_candidates_per_band: 64,
+            tonal_marked_subbands: [false; 32],
         }
     }
 }
@@ -785,7 +818,7 @@ fn candidate_total_bits(candidate: &QuantizedSubband) -> usize {
 fn build_spectral_unit_budgeted(
     coefficients: &[f32],
     coding_mode: CodingMode,
-    _options: SearchOptions,
+    search: SearchOptions,
     target_bits: usize,
 ) -> Result<SpectrumEncoding> {
     ensure!(
@@ -854,46 +887,100 @@ fn build_spectral_unit_budgeted(
         }
     }
 
-    // --- Phase 4: Mid-start budget allocation ---
-    // Start at a moderate tblIndex proportional to peak sfIndex, then
-    // demote if over budget, promote if under budget.
+    // --- Phase 4: budget allocation, reference-aligned ---
     let budget_10x = available_bits * 10;
 
-    // Initial assignment: map peak sfIndex to a starting tblIndex,
-    // with frequency-dependent boost for high bands to prevent dumpfness.
+    // Tonal-driven asymmetric upward neighbour spread. For every subband
+    // that the tonal extractor marked as containing a tone, the spread
+    // pulls quantization precision onto its neighbours, with the upper
+    // neighbour pulled in more strongly than the lower one. This is what
+    // preserves the harmonic envelope above prominent tones (violin
+    // partials, cymbal harmonics) without resorting to a pauschal HF
+    // boost. Magnitudes are scaled from the reference encoder's `Q0`
+    // weight table; we apply them to peak_sf units (each step is a
+    // factor of 2^(1/3) in amplitude), divided by 256 to bring them into
+    // our smaller score domain.
+    let mut effective_peak = band_peak_sf;
+    for band in 0..num_active_bands {
+        if !search.tonal_marked_subbands[band] {
+            continue;
+        }
+        // Use the table-class index from the peak-derived initial tblIdx.
+        let tbl_guess = ((band_peak_sf[band] + 4) / 8).clamp(1, 7);
+        let spread_idx = (((tbl_guess - 1) >> 1) as usize).min(4);
+        let factor = TONAL_SPREAD_Q0[spread_idx].unsigned_abs() as i32;
+        let lower_peak = if band > 0 { band_peak_sf[band - 1] } else { 0 };
+        let upper_peak = if band + 1 < num_active_bands {
+            band_peak_sf[band + 1]
+        } else {
+            0
+        };
+        // Translate the reference encoder's score-domain delta into our
+        // peak_sf-domain delta. Sony's scores are stored as `peak_sf * 256`,
+        // so a Q0 factor of 225 multiplied by `(peak_sf * 256 + neighbor *
+        // 256)` produces a delta in the millions, then shifted right by
+        // 8 to get back to peak_sf units. We do the equivalent here in one
+        // shot: `(factor * peak_total) >> 8`.
+        //
+        // Neighbour share: upper neighbour gets a quarter of the self
+        // delta (Sony >>2), lower neighbour gets an eighth (Sony >>3).
+        // The upward asymmetry preserves harmonic structure above strong
+        // tones, which is what gives violin partials and cymbal
+        // overtones their identity.
+        let self_delta = (factor * (band_peak_sf[band] + upper_peak)) >> 8;
+        effective_peak[band] = (effective_peak[band] + self_delta).min(63);
+        if band + 1 < num_active_bands {
+            let up_delta = (factor * (band_peak_sf[band] + upper_peak)) >> 10;
+            effective_peak[band + 1] = (effective_peak[band + 1] + up_delta).min(63);
+        }
+        if band > 0 {
+            let dn_delta = (factor * (band_peak_sf[band] + lower_peak)) >> 11;
+            effective_peak[band - 1] = (effective_peak[band - 1] + dn_delta).min(63);
+        }
+    }
+
+    // Initial assignment: map effective peak sfIndex to a starting tblIndex.
+    // No pauschal high-frequency boost. The reference encoder does not
+    // uniformly favour higher bands; it shapes the spectrum through the
+    // LF-first overshoot reducer below and through the tonal-driven
+    // neighbour spread above, both of which produce a smoother spectral
+    // profile than an unconditional HF boost would.
     let mut total_cost: i32 = 0;
     for band in 0..num_active_bands {
         if band_peak_sf[band] == 0 { continue; }
-        // Base: peak/8 clamped to 1-7
-        let mut initial = ((band_peak_sf[band] + 4) / 8).clamp(1, 7);
-        // High-frequency boost: subbands above band 8 (>5.5kHz) get +1-2 tblIndex
-        // to preserve brilliance/presence energy that low sfIndex would otherwise kill
-        if band >= 16 && band_peak_sf[band] >= 2 {
-            initial = (initial + 2).min(7);
-        } else if band >= 8 && band_peak_sf[band] >= 2 {
-            initial = (initial + 1).min(7);
-        }
+        let initial = ((effective_peak[band] + 4) / 8).clamp(1, 7);
         tbl_indices[band] = initial as u8;
         total_cost += cost_at[band][initial as usize];
     }
 
-    // Demote if over budget — but NEVER below tblIndex=1 for active bands.
-    // Sony codes ALL subbands with at least tblIndex=1, preserving energy
-    // across all frequencies. Skipping (tblIndex=0) causes the "dumpf" effect.
+    // LF-first overshoot reducer. When the cost exceeds the budget, the
+    // reference encoder reduces the lower bands much more aggressively
+    // than the higher ones. We approximate that here by walking down the
+    // band priority weighted by `LF_OVERSHOOT_WEIGHTS_Q8`, demoting one
+    // step at a time, with low bands offered up first.
     while total_cost > budget_10x {
         let mut best_band = None;
         let mut best_savings: i32 = 0;
-        let mut best_loss = f32::INFINITY;
+        let mut best_score = f32::NEG_INFINITY;
 
         for band in 0..num_active_bands {
             let current_tbl = tbl_indices[band];
-            if current_tbl <= 1 { continue; } // never demote below 1!
+            if current_tbl <= 1 { continue; }
             let next_tbl = current_tbl - 1;
             let savings = cost_at[band][current_tbl as usize] - cost_at[band][next_tbl as usize];
             if savings <= 0 { continue; }
-            let loss = band_peak_sf[band] as f32 / savings as f32;
-            if best_band.is_none() || loss < best_loss {
-                best_loss = loss;
+            let weight = if band < LF_OVERSHOOT_WEIGHTS_Q8.len() {
+                LF_OVERSHOOT_WEIGHTS_Q8[band] as f32
+            } else {
+                LF_OVERSHOOT_WEIGHTS_Q8[LF_OVERSHOOT_WEIGHTS_Q8.len() - 1] as f32
+            };
+            // Higher weight + larger savings = stronger candidate to demote.
+            // band_peak_sf still guards against demoting away the loudest
+            // bands when their LF weight ties with quieter ones.
+            let score =
+                weight * savings as f32 / (band_peak_sf[band] as f32 + 1.0);
+            if score > best_score {
+                best_score = score;
                 best_band = Some(band);
                 best_savings = savings;
             }
@@ -908,7 +995,11 @@ fn build_spectral_unit_budgeted(
         }
     }
 
-    // Promote if under budget (most important first)
+    // Promote if under budget. Use effective_peak so that tonal-marked
+    // bands and their boosted upper neighbours are promoted before
+    // unrelated quiet bands. Otherwise the tonal spread upstream would
+    // be partly undone here when the promoter picks bands purely by
+    // raw peak energy.
     loop {
         let mut best_band = None;
         let mut best_efficiency = f32::NEG_INFINITY;
@@ -920,7 +1011,7 @@ fn build_spectral_unit_budgeted(
             let next_tbl = current_tbl + 1;
             let delta = cost_at[band][next_tbl as usize] - cost_at[band][current_tbl as usize];
             if delta <= 0 || total_cost + delta > budget_10x { continue; }
-            let efficiency = band_peak_sf[band] as f32 / delta as f32;
+            let efficiency = effective_peak[band] as f32 / delta as f32;
             if efficiency > best_efficiency {
                 best_efficiency = efficiency;
                 best_band = Some(band);
@@ -1024,11 +1115,18 @@ fn build_spectral_unit_budgeted(
                 t > 0 && t < 7
             })
             .collect();
-        // Most important = highest peak in low-frequency bands first.
+        // Sort by current scale factor index descending. Bands that
+        // currently use the highest sfIndex are the bands whose
+        // quantization grid is coarsest, which are also the bands most
+        // likely to be audibly noisy. Promoting them next is therefore
+        // where added precision pays off most. This matches the reference
+        // encoder's final-round sfIndex-priority sort and replaces the
+        // earlier peak-magnitude sort which over-invested in already
+        // well-resolved low bands.
         order.sort_by(|&a, &b| {
-            let pa = band_peak_sf[a] as f32;
-            let pb = band_peak_sf[b] as f32;
-            pb.partial_cmp(&pa).unwrap()
+            let sa = quantized_subbands[a].scale_factor_index.unwrap_or(0);
+            let sb = quantized_subbands[b].scale_factor_index.unwrap_or(0);
+            sb.cmp(&sa)
         });
 
         let mut upgrades_this_pass = 0usize;
@@ -1350,6 +1448,10 @@ pub struct TonalExtractionResult {
     pub tonal_components: Vec<super::sound_unit::TonalComponent>,
     pub tonal_bits: usize,
     pub coded_qmf_bands: u8,
+    /// One bit per subband (0..32). True if at least one tonal entry was
+    /// extracted from this subband. The spectral allocator uses this mask
+    /// to drive the asymmetric upward neighbour spread.
+    pub tonal_subbands: [bool; 32],
 }
 
 /// Scan the residual for prominent peaks and encode them as tonal
@@ -1388,6 +1490,7 @@ pub fn extract_tonal_components(
             tonal_components: Vec::new(),
             tonal_bits: 0,
             coded_qmf_bands,
+            tonal_subbands: [false; 32],
         });
     }
 
@@ -1395,6 +1498,7 @@ pub fn extract_tonal_components(
     let mut band_active = vec![false; qmf_bands];
     let mut total_bits = base_bits;
     let mut total_entries: usize = 0;
+    let mut tonal_subbands = [false; 32];
 
     // First pass: collect all candidate chunks above threshold, each with
     // its peak magnitude. Candidates are always 4-aligned.
@@ -1487,6 +1591,13 @@ pub fn extract_tonal_components(
         }
         total_bits += entry_bits;
         total_entries += 1;
+
+        // Mark the spectral subband that contains this position as tonal,
+        // so the spectral allocator can apply the asymmetric upward
+        // neighbour spread later.
+        if let Some(subband) = subband_index_for_position(pos) {
+            tonal_subbands[subband] = true;
+        }
     }
 
     if total_entries == 0 {
@@ -1495,6 +1606,7 @@ pub fn extract_tonal_components(
             tonal_components: Vec::new(),
             tonal_bits: 0,
             coded_qmf_bands,
+            tonal_subbands: [false; 32],
         });
     }
 
@@ -1514,7 +1626,20 @@ pub fn extract_tonal_components(
         tonal_components: vec![component],
         tonal_bits: total_bits,
         coded_qmf_bands,
+        tonal_subbands,
     })
+}
+
+/// Map a spectral coefficient index (0..1024) to a subband index (0..32),
+/// using the same band table that the allocator uses. Returns None when
+/// the position falls outside the coded range.
+fn subband_index_for_position(pos: usize) -> Option<usize> {
+    for band in 0..32 {
+        if pos >= ATRAC3_SUBBAND_TAB[band] && pos < ATRAC3_SUBBAND_TAB[band + 1] {
+            return Some(band);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
