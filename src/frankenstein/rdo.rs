@@ -106,12 +106,25 @@ pub fn allocate(
     // real music lives.
     let low_pass_source = psycho.hf_energy_ratio < 0.001;
 
+    // atracdenc-style per-band noise-kill rolled back. Its peak/mean
+    // threshold (2.5) is tuned for 32-bin BFUs; our subbands range
+    // from 8 to 128 coefficients, so a Gaussian distribution alone
+    // pushes the ratio below 2.5 on the wider ATRAC3 subbands. It
+    // mis-classified real content as noise and regressed the
+    // benchmark by 3 points. The right implementation would
+    // normalise the threshold per band-width, or operate on
+    // atracdenc-sized 32-bin sub-BFUs, not whole ATRAC3 subbands.
+    let band_is_noise = [false; 32];
+
     let mut weights = [0.0_f32; 32];
     for b in 0..num_active {
         let smr = psycho.subband_energy_db[b] - psycho.subband_mask_db[b];
         let above_mask = smr.max(0.5).min(25.0);
         let tonality_boost = 1.0 + psycho.tonality[b];
         let mut w = above_mask * tonality_boost;
+        if band_is_noise[b] {
+            w = 0.0;
+        }
 
         // Previously: on transient frames, HF bands (≥16) were
         // damped ×0.5 to reduce pre-echo ringing. Result (measured
@@ -169,18 +182,16 @@ pub fn allocate(
     // Mirrors classic's MIN_TBL intent but is now driven by psycho's
     // ATH headroom rather than a hard-coded band index.
     let mut hf_floor = [0u8; 32];
-    // Transient-aware HF-priority hold. When a transient fires in
-    // this frame OR fired last frame, the Mid-band energy dominates
-    // the Lagrangian cost function and the HF bands lose priority
-    // even though sibilance/sizzle is psychoacoustically critical
-    // exactly there. Measured on Crystallize90 snares: HF energy
-    // drops 2-3 dB below reference in ±150 ms windows around each
-    // attack. Raise the HF floor by one tbl step in those frames so
-    // the allocator can't starve sizzle to feed the transient's body.
+    // Transient-aware HF-priority hold (placeholder; v29 rolled back
+    // the active use, kept the detection for future work).
     let frame_has_transient =
         psycho.transient_per_qmf.iter().any(|&t| t)
      || psycho.prev_transient_per_qmf.iter().any(|&t| t);
     for b in 0..num_active {
+        // Noise-like band (atracdenc gate): skip floor, RDO will drop.
+        if band_is_noise[b] {
+            continue;
+        }
         let headroom = psycho.subband_energy_db[b] - psycho.ath_db[b];
         if headroom <= 6.0 {
             continue;
