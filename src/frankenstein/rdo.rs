@@ -81,37 +81,61 @@ pub fn allocate(
     // bands × 7 tbls × 3 sf-deltas = ~672 quantise calls per frame.
     let candidates = build_candidates(coefficients, coding_mode, num_active)?;
 
-    // Perceptual weight per band:
-    //   w = softplus(signal - mask) × (1 + tonality)
-    // Clamp so w stays finite. Bands at or below their masking floor
-    // contribute almost nothing; bands peeking above get more weight.
+    // Perceptual weight per band. Three shaping terms:
+    //  - (signal − mask), clamped to [0.5, 25] dB. Clamp bottom so no
+    //    live band gets literally zero weight; clamp top so a 45-dB-
+    //    above-mask bass drum doesn't hog the entire bit budget.
+    //  - tonality_boost (1.0 … 2.0): tonal signal needs more accuracy
+    //    than noise of the same loudness.
+    //  - transient HF dampen (× 0.5 for bands ≥ 16 in a transient-flagged
+    //    QMF subband): pre-echo comes from precisely-coded HF
+    //    coefficients ringing before the attack. Slightly coarser HF
+    //    in transient frames trades a tiny SNR hit for big pre-echo
+    //    reduction.
     let mut weights = [0.0_f32; 32];
     for b in 0..num_active {
         let smr = psycho.subband_energy_db[b] - psycho.subband_mask_db[b];
-        // softplus(x) ≈ max(0, x) + 1 for large x, smoothly transitions
-        // at x = 0. We use a simpler max(0.5, smr) so no band gets
-        // strictly zero weight (otherwise the allocator might drop it
-        // and then we can't distinguish it from truly silent bands).
-        let above_mask = smr.max(0.5);
+        let above_mask = smr.max(0.5).min(25.0);
         let tonality_boost = 1.0 + psycho.tonality[b];
-        weights[b] = above_mask * tonality_boost;
+        let mut w = above_mask * tonality_boost;
+
+        let qmf_band = (b / 8).min(3);
+        if psycho.transient_per_qmf[qmf_band] && b >= 16 {
+            w *= 0.5;
+        }
+        weights[b] = w;
+    }
+
+    // HF safety floor: Presence/Brilliance bands whose signal sits
+    // well above ATH are pinned to a minimum tbl so the RDO can't
+    // starve them into `drop` when an LF band looks more efficient.
+    // Mirrors classic's MIN_TBL intent but is now driven by psycho's
+    // ATH headroom rather than a hard-coded band index.
+    let mut hf_floor = [0u8; 32];
+    for b in 0..num_active {
+        let headroom = psycho.subband_energy_db[b] - psycho.ath_db[b];
+        if headroom > 12.0 {
+            if b >= 28 {
+                hf_floor[b] = 2;   // Brilliance — 5 mantissa levels
+            } else if b >= 22 {
+                hf_floor[b] = 1;   // Presence + Upper-Mid top
+            }
+        }
     }
 
     if debug {
         eprintln!("[frank] num_active={} overhead={} avail={} pe_bits={:.0}",
                   num_active, fixed_overhead, available, psycho.pe_required_bits);
         for b in 0..num_active {
-            eprintln!("  b{:2}  sig={:+7.1}  mask={:+7.1}  ath={:+7.1}  ton={:.2}  w={:.2}",
+            eprintln!("  b{:2}  sig={:+7.1}  mask={:+7.1}  ath={:+7.1}  ton={:.2}  w={:.2}  floor={}",
                 b, psycho.subband_energy_db[b], psycho.subband_mask_db[b],
-                psycho.ath_db[b], psycho.tonality[b], weights[b]);
+                psycho.ath_db[b], psycho.tonality[b], weights[b], hf_floor[b]);
         }
+        eprintln!("[frank] transients={:?}", psycho.transient_per_qmf);
     }
 
-    // Lagrangian λ-search. We search in log-space between very small
-    // and very large. The objective is monotone in λ (higher λ favours
-    // fewer bits), so plain bisection works.
     let (tbl_choice, sf_choice, used_bits) =
-        lambda_search(&candidates, &weights, num_active, available);
+        lambda_search(&candidates, &weights, &hf_floor, num_active, available);
 
     if debug {
         eprintln!("[frank] after λ: used={}/{} tbls={:?}",
@@ -122,7 +146,7 @@ pub fn allocate(
     // set, drop the least-valuable band until we fit. This is the
     // safety net for pathological frames.
     let (tbl_choice, sf_choice, used_bits) =
-        tighten_to_budget(&candidates, &weights, num_active, available, tbl_choice, sf_choice, used_bits);
+        tighten_to_budget(&candidates, &weights, &hf_floor, num_active, available, tbl_choice, sf_choice, used_bits);
 
     // Emit the SpectrumEncoding.
     assemble_encoding(coefficients, coding_mode, num_active, &candidates, &tbl_choice, &sf_choice, used_bits, fixed_overhead)
@@ -192,22 +216,31 @@ fn build_candidates(
 fn pick_for_lambda(
     candidates: &[Option<BandCandidates>; 32],
     weights: &[f32; 32],
+    hf_floor: &[u8; 32],
     num_active: usize,
     lambda: f32,
 ) -> ([u8; 32], [usize; 32], usize) {
     let mut tbl_choice = [0u8; 32];
-    let mut sf_choice = [0usize; 32]; // index into real-candidates list
+    let mut sf_choice = [0usize; 32];
     let mut total_bits = 0usize;
 
     for b in 0..num_active {
         let Some(bc) = candidates[b].as_ref() else { continue };
         let w = weights[b];
-        let score_drop = bc.drop.bits as f32 + lambda * w * bc.drop.mse;
-        let mut best_score = score_drop;
-        let mut best_tbl = 0u8;
-        let mut best_idx = 0usize;
-        let mut best_bits = bc.drop.bits;
+        let min_tbl = hf_floor[b];
+
+        // Consider the drop candidate only if there's no safety floor
+        // for this band.
+        let (mut best_score, mut best_tbl, mut best_idx, mut best_bits) = if min_tbl == 0 {
+            (bc.drop.bits as f32 + lambda * w * bc.drop.mse, 0u8, 0usize, bc.drop.bits)
+        } else {
+            (f32::INFINITY, 0u8, 0usize, 0usize)
+        };
+
         for (i, cand) in bc.real.iter().enumerate() {
+            if cand.q.table_index < min_tbl {
+                continue;
+            }
             let score = cand.bits as f32 + lambda * w * cand.mse;
             if score < best_score {
                 best_score = score;
@@ -227,6 +260,7 @@ fn pick_for_lambda(
 fn lambda_search(
     candidates: &[Option<BandCandidates>; 32],
     weights: &[f32; 32],
+    hf_floor: &[u8; 32],
     num_active: usize,
     target: usize,
 ) -> ([u8; 32], [usize; 32], usize) {
@@ -239,8 +273,8 @@ fn lambda_search(
     let mut lo = 1e-6_f32;   // tiny λ → minimises bits → "drop everything"
     let mut hi = 1e9_f32;    // large λ → minimises mse   → "max tbl everywhere"
 
-    let (tl_lo, sf_lo, bits_lo) = pick_for_lambda(candidates, weights, num_active, lo);
-    let (tl_hi, sf_hi, bits_hi) = pick_for_lambda(candidates, weights, num_active, hi);
+    let (tl_lo, sf_lo, bits_lo) = pick_for_lambda(candidates, weights, hf_floor, num_active, lo);
+    let (tl_hi, sf_hi, bits_hi) = pick_for_lambda(candidates, weights, hf_floor, num_active, hi);
 
     // Happy path: even max-quality fits. Take it.
     if bits_hi <= target {
@@ -258,7 +292,7 @@ fn lambda_search(
     for _ in 0..24 {
         let mid = (lo.ln() + hi.ln()) * 0.5;
         let lam = mid.exp();
-        let (tl, sf, bits) = pick_for_lambda(candidates, weights, num_active, lam);
+        let (tl, sf, bits) = pick_for_lambda(candidates, weights, hf_floor, num_active, lam);
         if bits <= target {
             // Feasible — this is our best-so-far. Try to push higher λ
             // for even more bits.
@@ -278,6 +312,7 @@ fn lambda_search(
 fn tighten_to_budget(
     candidates: &[Option<BandCandidates>; 32],
     weights: &[f32; 32],
+    hf_floor: &[u8; 32],
     num_active: usize,
     target: usize,
     mut tbl_choice: [u8; 32],
@@ -286,6 +321,7 @@ fn tighten_to_budget(
 ) -> ([u8; 32], [usize; 32], usize) {
     // Fallback tightener: if we're still over budget due to ties in the
     // λ-search, demote the band with the lowest perceptual cost per bit.
+    // HF-floor bands are still demotable but only down to their floor.
     while used_bits > target {
         let mut best_band = None;
         let mut best_score = f32::INFINITY;
@@ -297,18 +333,26 @@ fn tighten_to_budget(
             // Current and demoted candidate indexes:
             let cur_idx = sf_choice[b];
             let cur = &bc.real[cur_idx];
-            // Find next-smaller tbl (or drop).
-            let mut alt_bits = bc.drop.bits;
-            let mut alt_mse = bc.drop.mse;
+            let min_tbl = hf_floor[b];
+            // Find next-smaller tbl that still respects the HF floor.
+            // If min_tbl > 0 and current is already at floor, skip —
+            // this band can't be demoted further.
+            let mut alt_bits = if min_tbl == 0 { bc.drop.bits } else { usize::MAX };
+            let mut alt_mse = if min_tbl == 0 { bc.drop.mse } else { f32::INFINITY };
             let mut alt_idx: Option<usize> = None;
             for (i, cand) in bc.real.iter().enumerate() {
-                if cand.q.table_index < cur.q.table_index && cand.bits < cur.bits {
+                if cand.q.table_index < cur.q.table_index
+                    && cand.q.table_index >= min_tbl
+                    && cand.bits < cur.bits {
                     if alt_idx.is_none() || cand.bits > alt_bits {
                         alt_bits = cand.bits;
                         alt_mse = cand.mse;
                         alt_idx = Some(i);
                     }
                 }
+            }
+            if alt_idx.is_none() && min_tbl > 0 {
+                continue;  // already at HF floor, can't demote
             }
             // Cost of demotion = mse rise × weight, per bit saved.
             let bits_saved = cur.bits.saturating_sub(alt_bits);

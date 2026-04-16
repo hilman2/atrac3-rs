@@ -12,7 +12,17 @@
 //!  - ISO/IEC 11172-3 Annex D Psychoacoustic Model 2 (SFM-based
 //!    tonality, perceptual entropy).
 
+use std::cell::RefCell;
+
 use crate::atrac3::{SAMPLES_PER_FRAME, quant::ATRAC3_SUBBAND_TAB};
+
+thread_local! {
+    /// Per-QMF-subband RMS energy of the previous frame, used for the
+    /// frame-to-frame jump transient detector. Shared across L/R — that
+    /// blurs stereo transients slightly but costs one buffer instead of
+    /// two and is good enough for gain steering.
+    static PREV_QMF_ENERGY: RefCell<[f32; 4]> = const { RefCell::new([0.0; 4]) };
+}
 
 /// Number of Bark critical bands we use (Zwicker 1980).
 pub const N_BARK: usize = 24;
@@ -93,15 +103,46 @@ pub fn compute(coefficients: &[f32], sample_rate: u32) -> PsychoDrive {
         pe += bits_here;
     }
 
+    let transient_per_qmf = detect_transients(coefficients);
+
     PsychoDrive {
         bark_energy_db: bark_e_db,
         subband_mask_db,
         subband_energy_db,
         tonality: tonality_per_subband,
         ath_db,
-        transient_per_qmf: [false; 4],
+        transient_per_qmf,
         pe_required_bits: pe,
     }
+}
+
+// ---------- Transient detection (frame-to-frame energy jump) ----------
+
+/// Detects transients per QMF subband by comparing the current frame's
+/// in-band energy to the previous frame's, sharing a thread-local
+/// buffer across channels. A 4× jump marks the subband as transient;
+/// that flag drives the RDO's HF weight boost and (later) the gain
+/// envelope's attack-point count.
+fn detect_transients(coefficients: &[f32]) -> [bool; 4] {
+    let mut current = [0.0f32; 4];
+    for q in 0..4 {
+        let mut e = 1e-20_f32;
+        for c in &coefficients[q * 256..(q + 1) * 256] {
+            e += c * c;
+        }
+        current[q] = e;
+    }
+    let prev = PREV_QMF_ENERGY.with(|c| *c.borrow());
+    let mut out = [false; 4];
+    for q in 0..4 {
+        // 4× energy jump + minimum absolute level to avoid firing on
+        // noise in otherwise silent frames.
+        if current[q] > 4.0 * prev[q].max(1e-10) && current[q] > 1e-3 {
+            out[q] = true;
+        }
+    }
+    PREV_QMF_ENERGY.with(|c| *c.borrow_mut() = current);
+    out
 }
 
 // ---------- Bark band energies ----------
