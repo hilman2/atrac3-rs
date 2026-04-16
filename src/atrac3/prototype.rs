@@ -757,7 +757,7 @@ impl PrototypeEncoder {
                     if ratio > best_ratio { best_ratio = ratio; onset_slot = k; }
                     running_max = running_max.max(slot_energy[k]);
                 }
-                if best_ratio > 12.0 && onset_slot >= 2 {
+                if best_ratio > 30.0 && onset_slot >= 2 {
                     let onset_sample = onset_slot * 32;
                     for i in 0..onset_sample {
                         let t = i as f32 / onset_sample as f32;
