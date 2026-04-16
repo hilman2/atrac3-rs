@@ -380,7 +380,7 @@ impl PrototypeEncoder {
                     .map(|a| a.hf_noise_ratio).fold(0.0f32, f32::max);
 
                 // Entscheide ob Pass 2 lohnt
-                let needs_pass2 = max_surplus > 20
+                let needs_pass2 = !env_flag("ATRAC3_NO_PASS2", false) && max_surplus > 20
                     || any_pre_echo
                     || max_hf_ratio > 1.2; // HF zu laut → Floor-Sub aggressiver
 
@@ -433,7 +433,10 @@ impl PrototypeEncoder {
 
                     let mut pass2_search = search_opts;
                     pass2_search.target_bits = Some(base_target + max_surplus / 2);
-                    pass2_search.use_rdo = is_clean_source_global;
+                    // RDO Pass-2 DEAKTIVIERT: zerstört HF-Signale (hohe Töne,
+                    // Einfade-Harmonics) weil sqrt(MSE)/bits LF bevorzugt.
+                    // Psycho v2's sfIndex-basierte Promotion erhält HF besser.
+                    pass2_search.use_rdo = false;
 
                     match encoder.encode_analyzed_frame(&pass2_analyses, options.coding_mode, pass2_search) {
                         Ok(f) if f.channels.iter().all(|ch| ch.bytes.len() <= 192) => Ok(f),
