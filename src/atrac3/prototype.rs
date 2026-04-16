@@ -396,6 +396,44 @@ impl PrototypeEncoder {
                 4,
             )?;
 
+            // HF Noise-Reduction: zwei Techniken kombiniert.
+            //
+            // 1. Source-Quality-Detection (128kbit MP3 erkennen):
+            //    Wenn die Source oberhalb 16kHz quasi keine Energie hat
+            //    (MP3 128kbit Low-Pass), wird Brilliance komplett genullt.
+            //    Kein Sinn MP3-Noise zu encoden → Bits für Mid/Presence.
+            //
+            // 2. Brilliance Noise-Gate (Sony-Trick "weniger = natürlicher"):
+            //    Schwache Brilliance-Coefs (< 10% Peak-Power) auf 0 setzen.
+            //    Reduziert rekonstruierte Power von 121% auf ~65% (Sony-Level).
+            let hf_start = 768; // Band 30 start
+            let hf_end = residual.len().min(1024);
+            // Source-Detection: prüfe ob HF-Signal echt ist
+            let hf_power: f32 = residual[hf_start..hf_end].iter()
+                .map(|c| c * c).sum();
+            let total_power: f32 = residual.iter().map(|c| c * c).sum();
+            let hf_ratio = hf_power / (total_power + 1e-20);
+            if hf_ratio < 0.001 {
+                // MP3 128kbit oder ähnlich: kein echtes HF → komplett nullen
+                for c in residual[hf_start..hf_end].iter_mut() { *c = 0.0; }
+            } else {
+                // Echtes HF vorhanden → nur schwache Coefs nullen (Noise-Gate)
+                let mut peak_power: f32 = 0.0;
+                for chunk in residual[hf_start..hf_end].chunks(4) {
+                    let p: f32 = chunk.iter().map(|c| c * c).sum();
+                    peak_power = peak_power.max(p);
+                }
+                if peak_power > 1e-12 {
+                    let threshold = peak_power * 0.10;
+                    for chunk in residual[hf_start..hf_end].chunks_mut(4) {
+                        let p: f32 = chunk.iter().map(|c| c * c).sum();
+                        if p < threshold {
+                            for c in chunk.iter_mut() { *c = 0.0; }
+                        }
+                    }
+                }
+            }
+
             let mut adjusted_search = search;
             adjusted_search.target_bits =
                 Some(spectral_budget.saturating_sub(tonal_result.tonal_bits));
