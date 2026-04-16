@@ -414,9 +414,12 @@ impl PrototypeEncoder {
                         }
                     }
 
+                    // Pass 2: Psycho v2 + RDO-Nachschlag.
+                    // ERST Psycho v2 (warmer Sound), DANN RDO NUR für surplus-Bits.
+                    // Das behält die warme Grundstruktur und füllt nur die Lücken.
                     let mut pass2_search = search_opts;
                     pass2_search.target_bits = Some(base_target + max_surplus / 2);
-                    pass2_search.use_rdo = true; // RDO-Allocator mit echten Kosten
+                    pass2_search.use_rdo = false; // Psycho v2 bleibt Basis!
 
                     match encoder.encode_analyzed_frame(&pass2_analyses, options.coding_mode, pass2_search) {
                         Ok(f) if f.channels.iter().all(|ch| ch.bytes.len() <= 192) => Ok(f),
