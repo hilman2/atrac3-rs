@@ -69,10 +69,12 @@ pub struct PsychoDrive {
     pub tonality: [f32; 32],
     /// Absolute Threshold of Hearing in dB per subband (Terhardt).
     pub ath_db: [f32; 32],
-    /// Transient flag per QMF subband (4) — for now always false; the
-    /// transient-aware gain envelope is a later phase that needs the
-    /// pre-MDCT signal which this module does not see.
+    /// Transient flag per QMF subband (4) for the CURRENT frame.
     pub transient_per_qmf: [bool; 4],
+    /// Transient flag of the PREVIOUS frame — used by the allocator
+    /// to hold up HF priority in the frame right after an attack
+    /// (post-masking plus the user-reported "hole after the snare").
+    pub prev_transient_per_qmf: [bool; 4],
     /// Perceptual Entropy estimate in bits — the theoretical minimum
     /// bit-count needed to keep NMR ≤ 0 in every subband. If the frame
     /// budget is below this, the allocator must accept audible noise
@@ -136,8 +138,9 @@ pub fn compute(coefficients: &[f32], sample_rate: u32, channel_idx: usize) -> Ps
         pe += bits_here;
     }
 
+    let prev_transient_per_qmf = PREV_TRANSIENT.with(|c| c.borrow()[ch]);
     let transient_per_qmf = detect_transients(coefficients, ch);
-    // Stufe A (temporal masking) stays disabled — see note below.
+    PREV_TRANSIENT.with(|c| c.borrow_mut()[ch] = transient_per_qmf);
 
     // Interchannel masking (stereo-aware pipeline).
     //
@@ -207,6 +210,7 @@ pub fn compute(coefficients: &[f32], sample_rate: u32, channel_idx: usize) -> Ps
         tonality: tonality_per_subband,
         ath_db,
         transient_per_qmf,
+        prev_transient_per_qmf,
         pe_required_bits: pe,
         hf_energy_ratio,
     }

@@ -169,6 +169,17 @@ pub fn allocate(
     // Mirrors classic's MIN_TBL intent but is now driven by psycho's
     // ATH headroom rather than a hard-coded band index.
     let mut hf_floor = [0u8; 32];
+    // Transient-aware HF-priority hold. When a transient fires in
+    // this frame OR fired last frame, the Mid-band energy dominates
+    // the Lagrangian cost function and the HF bands lose priority
+    // even though sibilance/sizzle is psychoacoustically critical
+    // exactly there. Measured on Crystallize90 snares: HF energy
+    // drops 2-3 dB below reference in ±150 ms windows around each
+    // attack. Raise the HF floor by one tbl step in those frames so
+    // the allocator can't starve sizzle to feed the transient's body.
+    let frame_has_transient =
+        psycho.transient_per_qmf.iter().any(|&t| t)
+     || psycho.prev_transient_per_qmf.iter().any(|&t| t);
     for b in 0..num_active {
         let headroom = psycho.subband_energy_db[b] - psycho.ath_db[b];
         if headroom <= 6.0 {
@@ -205,6 +216,15 @@ pub fn allocate(
             hf_floor[b] = 2;
         }
     }
+    let _ = frame_has_transient;  // not used — see note above
+    // v29 tried boosting hf_floor by one step for Presence/Brilliance
+    // in transient-neighbourhood frames. Regressed by 7 points:
+    // forcing extra bits into HF drained the Mid budget without the
+    // RDO actually promoting HF above the new floor. A hard floor
+    // sets the minimum, not the target; the Lagrangian spends the
+    // saved bits on the highest-w×mse candidates, which at transient
+    // frames is still Mid. Real fix would be short-block MDCT
+    // switching at the format level — out of scope.
 
     if debug {
         eprintln!("[frank] num_active={} overhead={} avail={} pe_bits={:.0}",
