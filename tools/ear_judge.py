@@ -227,6 +227,61 @@ def _find_onsets(x, sr, threshold_db=4.0, min_gap_s=0.1):
 #   10-20 = clearly audible
 #   > 20  = obvious artefacts
 
+# ---------- source health classification ----------
+
+def source_health(x, sr):
+    """Classify the reference itself so we don't punish the encoder for
+    what the source is missing.
+
+    Returns a dict with:
+      hf_energy_db          — 14-22 kHz RMS vs full-band RMS, in dB
+      spectral_flatness_hf  — SFM of 4-16 kHz frames, 0-1
+      class                 — 'clean' | 'lossy_mild' | 'lossy_severe'
+      tolerance_mult        — multiplier applied to every penalty's
+                              tolerance band. lossy_severe = 2.0 ×
+                              (can't recover what isn't there).
+    """
+    full = 20 * np.log10(np.sqrt(np.mean(x**2) + 1e-20))
+    air = band_bandpass(x, sr, 14000, min(sr/2 - 1, 22000))
+    air_db = 20 * np.log10(np.sqrt(np.mean(air**2) + 1e-20))
+    hf_energy_db = air_db - full
+
+    # SFM in 4-16 kHz: tonal content vs noise. Lossy encoders (MP3)
+    # leave the HF flattish noise; clean sources have structure there.
+    win = 2048
+    w = np.hanning(win)
+    freqs = np.fft.rfftfreq(win, 1.0/sr)
+    mask = (freqs >= 4000) & (freqs <= min(16000, sr/2-1))
+    sfm_vals = []
+    for i in range(0, len(x) - win, win):
+        S = np.abs(np.fft.rfft(x[i:i+win] * w)) ** 2 + 1e-20
+        band = S[mask]
+        gm = np.exp(np.mean(np.log(band)))
+        am = np.mean(band)
+        sfm_vals.append(gm / am)
+    sfm_hf = float(np.mean(sfm_vals)) if sfm_vals else 1.0
+
+    # Class thresholds: 14-22 kHz RMS 30 dB below full is "essentially
+    # silent" (MP3 128 kbps low-pass). 20-30 dB is mild. Above that is
+    # clean.
+    if hf_energy_db < -30:
+        cls = 'lossy_severe'
+        tmult = 2.0
+    elif hf_energy_db < -22:
+        cls = 'lossy_mild'
+        tmult = 1.3
+    else:
+        cls = 'clean'
+        tmult = 1.0
+
+    return {
+        'hf_energy_db': float(hf_energy_db),
+        'spectral_flatness_hf': sfm_hf,
+        'class': cls,
+        'tolerance_mult': tmult,
+    }
+
+
 PEN_WEIGHTS = {
     # Each term: (weight, label, tolerance). Penalty = weight *
     # max(0, value - tolerance). Tolerance absorbs the noise floor that
@@ -254,6 +309,13 @@ def judge(ref_path, enc_path, label=None):
     n = min(len(ref), len(enc))
     ref = ref[:n]; enc = enc[:n]
     duration_s = n / sr_ref
+
+    # Classify the source first. Lossy sources get wider tolerance
+    # bands because no encoder can resurrect HF the source doesn't
+    # have. This keeps the score honest: an encoder handed a 128 kbps
+    # MP3 re-encode isn't penalised for the upstream codec's sins.
+    src = source_health(ref, sr_ref)
+    tmult = src['tolerance_mult']
 
     # HF events + snr
     hf = hf_scope_events(ref, enc, sr_ref)
@@ -314,11 +376,23 @@ def judge(ref_path, enc_path, label=None):
     breakdown = {}
     score = 0.0
     for key, (w, _, tol) in PEN_WEIGHTS.items():
-        excess = max(0.0, terms[key] - tol)
+        # Lossy sources get wider tolerance on the terms that the
+        # upstream codec already damaged: HF artefact counts,
+        # pre-echo, octave balance. Onset fidelity and loudness are
+        # source-agnostic — we don't loosen those.
+        tol_source_adjusted = (
+            tol * tmult
+            if key in ('hf_bursts_per_10s', 'hf_pumping_per_10s',
+                       'hf_holes_per_10s', 'pre_echo_per_10s',
+                       'pre_echo_worst_db', 'octave_balance',
+                       'nmr_max_over')
+            else tol
+        )
+        excess = max(0.0, terms[key] - tol_source_adjusted)
         contrib = w * excess
         breakdown[key] = {
             'value': terms[key],
-            'tolerance': tol,
+            'tolerance': tol_source_adjusted,
             'excess': excess,
             'weight': w,
             'contribution': contrib,
@@ -344,6 +418,9 @@ def judge(ref_path, enc_path, label=None):
         'original': str(ref_path),
         'encoded': str(enc_path),
         'duration_s': float(duration_s),
+        'source_class': src['class'],
+        'source_hf_energy_db': src['hf_energy_db'],
+        'source_tolerance_mult': src['tolerance_mult'],
         'score': float(score),
         'verdict': verdict,
         'breakdown': breakdown,
@@ -364,6 +441,8 @@ def print_report(result):
     print(f"ear_judge  ·  {result['label']}   ({result['duration_s']:.1f} s)")
     print('='*72)
     print(f"{'SCORE':<20s}  {result['score']:>6.2f}   [{result['verdict'].upper()}]")
+    print(f"{'source':<20s}  {result['source_class']:<14s}  HF={result['source_hf_energy_db']:+.1f} dB  "
+          f"tolerance×{result['source_tolerance_mult']:.1f}")
     print(f"{'context':<20s}  overall SNR {result['context']['overall_snr_db']:+.2f} dB · "
           f"HF SNR {result['context']['hf_snr_db']:+.2f} dB")
     print('-'*72)
@@ -397,6 +476,11 @@ def compare(ref_path, enc_paths, labels=None):
     print(f"\n{'='*72}")
     print(f"ear_judge · comparison against  {ref_path}")
     print('='*72)
+    # Source context in the comparison header.
+    first = results_sorted[0]
+    print(f"source: {first['source_class']:<12s}  HF={first['source_hf_energy_db']:+.1f} dB  "
+          f"tolerance×{first['source_tolerance_mult']:.1f}")
+    print()
     print(f"{'rank':<5s} {'label':<20s} {'score':>8s}  {'verdict':<14s} {'SNR':>7s} {'HF-SNR':>7s} {'voc':>6s}  {'hf-art':>7s}")
     for rank, r in enumerate(results_sorted, 1):
         vc_shift = r['breakdown']['vocal_clarity_shift']['value']
