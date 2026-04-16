@@ -80,6 +80,27 @@ def run(cmd):
     return result.stdout
 
 
+def _auto_tag(engine):
+    """Build an automatic tag `<engine>_<shortsha>[_dirty]_<HHMM>` so
+    that every run writes to a unique filename unless --tag overrides.
+    Falls back to a timestamp if git isn't available."""
+    from datetime import datetime
+    ts = datetime.now().strftime('%H%M')
+    try:
+        sha = subprocess.run(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            capture_output=True, text=True, cwd=REPO_ROOT, check=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ['git', 'status', '--porcelain'],
+            capture_output=True, text=True, cwd=REPO_ROOT, check=True,
+        ).stdout.strip()
+        dirty_suffix = '_d' if dirty else ''
+        return f'{engine}_{sha}{dirty_suffix}_{ts}'
+    except Exception:
+        return f'{engine}_{ts}'
+
+
 def ensure_tools():
     missing = [str(p) for p in (AT3CMP, PSP_TOOL) if not p.exists()]
     if missing:
@@ -251,6 +272,14 @@ def main():
                     help='Sony-bitrate in kbps (default: 132)')
     ap.add_argument('--label', default=None,
                     help='Label für die Ausgabe (default: Dateiname)')
+    ap.add_argument('--tag', default=None,
+                    help='Version-Tag für Output-Dateinamen. Default aus '
+                         'git HEAD + timestamp. Frühere Tags bleiben '
+                         'erhalten, neue überschreiben nichts.')
+    ap.add_argument('--engine', choices=['classic', 'frankenstein'],
+                    default='frankenstein',
+                    help='Encoder-Engine. "classic" = Psycho v2 + Sony-Tricks. '
+                         '"frankenstein" = neue RDO-Pipeline (default).')
     ap.add_argument('--no-stereo', action='store_true', help='Stereo-Analyse überspringen')
     ap.add_argument('--no-plot', action='store_true', help='Spektrogramm-PNG überspringen')
     ap.add_argument('--no-artifacts', action='store_true',
@@ -275,14 +304,22 @@ def main():
         print(f"ERROR: input_wav nicht gefunden: {input_wav}", file=sys.stderr)
         sys.exit(1)
 
-    stem = input_wav.stem
-    label = args.label or stem
+    # Route the engine via env-var so classic and frankenstein can
+    # coexist in the same run of this session.
+    if args.engine == 'frankenstein':
+        os.environ['ATRAC3_ENGINE'] = 'frankenstein'
+    else:
+        os.environ.pop('ATRAC3_ENGINE', None)
 
-    ours_at3 = TMP_DIR / f'{stem}_ours.at3'
-    ours_wav = TMP_DIR / f'{stem}_ours.wav'
+    stem = input_wav.stem
+    tag = args.tag or _auto_tag(args.engine)
+    label = args.label or f'{args.engine}_{tag}'
+
+    ours_at3 = TMP_DIR / f'{stem}_{tag}.at3'
+    ours_wav = TMP_DIR / f'{stem}_{tag}.wav'
     sony_at3 = TMP_DIR / f'{stem}_sony.at3'
     sony_wav = TMP_DIR / f'{stem}_sony.wav'
-    spectro_png = TMP_DIR / f'{stem}_ours_spectrogram.png'
+    spectro_png = TMP_DIR / f'{stem}_{tag}_spectrogram.png'
 
     if args.no_plot:
         os.environ['DIGITAL_EARS_NO_PLOT'] = '1'
@@ -292,6 +329,8 @@ def main():
         os.environ['DIGITAL_EARS_NO_ARTIFACTS'] = '1'
     else:
         os.environ.pop('DIGITAL_EARS_NO_ARTIFACTS', None)
+
+    print(f"engine={args.engine}  tag={tag}  → {ours_wav.name}")
 
     total_steps = 3 if args.sony else 2
     print(f"[1/{total_steps}] atrac3-rs encode ({args.bitrate}, VLC) …")
