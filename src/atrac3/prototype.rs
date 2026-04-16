@@ -298,18 +298,70 @@ impl PrototypeEncoder {
             all_analyses.push(analyses);
         }
 
-        // Phase 2: PARALLEL quantization + bitstream (each frame independent).
+        // ===== ECHTER 2-PASS ENCODING =====
         use rayon::prelude::*;
+        let base_target = options.target_bits_per_channel.unwrap_or(1536);
         let search_opts = SearchOptions {
             lambda: options.lambda,
             target_bits: options.target_bits_per_channel,
             max_candidates_per_band: 64,
             tonal_marked_subbands: [false; 32],
         };
-        let frames: Vec<PrototypeFrame> = all_analyses
+
+        // PASS 1: Encode mit Standard-Budget → sammle echte Metriken
+        let pass1_frames: Vec<PrototypeFrame> = all_analyses
             .par_iter()
             .map(|analyses| {
                 encoder.encode_analyzed_frame(analyses, options.coding_mode, search_opts)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // ANALYSE: pro Frame/Kanal messe echte Bits + Pre-Echo-Risk
+        struct FrameAnalysis {
+            surplus_bits: usize,
+            has_pre_echo_risk: bool,
+        }
+        let analyses_p1: Vec<Vec<FrameAnalysis>> = pass1_frames
+            .iter()
+            .enumerate()
+            .map(|(idx, frame)| {
+                frame.channels.iter().enumerate().map(|(ch, channel)| {
+                    let surplus = base_target.saturating_sub(channel.bit_len);
+                    // Pre-Echo-Risk: nächster Frame hat viel mehr Energie
+                    let has_risk = if idx + 1 < all_analyses.len() {
+                        let cur_e: f32 = all_analyses[idx][ch].coefficients.iter()
+                            .map(|c| c * c).sum();
+                        let next_e: f32 = all_analyses[(idx + 1).min(all_analyses.len()-1)][ch]
+                            .coefficients.iter().map(|c| c * c).sum();
+                        next_e > cur_e * 8.0
+                    } else { false };
+                    FrameAnalysis { surplus_bits: surplus, has_pre_echo_risk: has_risk }
+                }).collect()
+            })
+            .collect();
+
+        // PASS 2: Re-encode mit per-Frame optimiertem Budget
+        let frames: Vec<PrototypeFrame> = all_analyses
+            .par_iter()
+            .enumerate()
+            .map(|(idx, analyses)| {
+                let max_surplus = analyses_p1[idx].iter()
+                    .map(|a| a.surplus_bits).max().unwrap_or(0);
+                let any_pre_echo = analyses_p1[idx].iter().any(|a| a.has_pre_echo_risk);
+
+                if max_surplus > 30 || any_pre_echo {
+                    let mut pass2_search = search_opts;
+                    // Surplus in extra Budget umwandeln (konservativ /3)
+                    let extra = max_surplus / 3;
+                    pass2_search.target_bits = Some(base_target + extra);
+
+                    match encoder.encode_analyzed_frame(analyses, options.coding_mode, pass2_search) {
+                        Ok(f) if f.channels.iter().all(|ch| ch.bytes.len() <= 192) => Ok(f),
+                        _ => Ok(pass1_frames[idx].clone()),
+                    }
+                } else {
+                    Ok(pass1_frames[idx].clone())
+                }
             })
             .collect::<Result<Vec<_>>>()?;
 
