@@ -414,7 +414,7 @@ impl PrototypeEncoder {
             // 2. Brilliance Noise-Gate (Sony-Trick "weniger = natürlicher"):
             //    Schwache Brilliance-Coefs (< 10% Peak-Power) auf 0 setzen.
             //    Reduziert rekonstruierte Power von 121% auf ~65% (Sony-Level).
-            let hf_start = 768; // Band 30 start
+            let hf_start = 768; // Band 30 start (nur Brilliance)
             let hf_end = residual.len().min(1024);
             // Source-Detection: prüfe ob HF-Signal echt ist
             let hf_power: f32 = residual[hf_start..hf_end].iter()
@@ -425,14 +425,17 @@ impl PrototypeEncoder {
                 // MP3 128kbit oder ähnlich: kein echtes HF → komplett nullen
                 for c in residual[hf_start..hf_end].iter_mut() { *c = 0.0; }
             } else {
-                // Echtes HF vorhanden → nur schwache Coefs nullen (Noise-Gate)
+                // Echtes HF vorhanden → band-adaptive Noise-Gate.
+                // Presence (512-768): sanfter (15%) — enthält Stimmen/Harmonics
+                // Brilliance (768-1024): aggressiver (8%) — Sony 64% Ziel
+                // Nur Brilliance (768+) gaten. Presence enthält Stimmen.
                 let mut peak_power: f32 = 0.0;
                 for chunk in residual[hf_start..hf_end].chunks(4) {
                     let p: f32 = chunk.iter().map(|c| c * c).sum();
                     peak_power = peak_power.max(p);
                 }
                 if peak_power > 1e-12 {
-                    let threshold = peak_power * 0.10;
+                    let threshold = peak_power * 0.08;
                     for chunk in residual[hf_start..hf_end].chunks_mut(4) {
                         let p: f32 = chunk.iter().map(|c| c * c).sum();
                         if p < threshold {

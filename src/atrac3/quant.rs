@@ -1060,14 +1060,25 @@ fn build_spectral_unit_budgeted(
         // the peak; going above trades precision for coarser grid which the
         // criterion will prefer only when the finer grid actually produces
         // a worse worst-case bin.
+        // v3g sfIndex-Bump: HF-Bänder bekommen höheren Start-Delta und MSE-
+        // Kriterium statt max_abs_err. Gröbere Steps → mehr Mantissa=0 → weniger
+        // Noise-Power → natürlicherer HF-Sound (Sony's 64% statt 121%).
+        let (start_delta, max_delta) = if band >= 26 && band_peak_sf[band] < 12 {
+            (2i8, 6i8)
+        } else if band >= 20 && band_peak_sf[band] < 18 {
+            (1i8, 5i8)
+        } else {
+            (0i8, 3i8)
+        };
+        let use_mse = band >= 20;
         let mut best: Option<QuantizedSubband> = None;
         let mut best_score = f32::INFINITY;
-        for delta in 0i8..=3 {
+        for delta in start_delta..=max_delta {
             let sf_try = (sf_center as i8 + delta).clamp(0, 63) as u8;
             if let Ok(candidate) = quantize_subband(slice, selector, sf_try, coding_mode) {
                 let bits = candidate_total_bits(&candidate);
                 if used_bits + bits <= target_bits {
-                    let score = candidate.max_abs_err;
+                    let score = if use_mse { candidate.mse } else { candidate.max_abs_err };
                     if best.is_none() || score < best_score - 1e-12 {
                         best_score = score;
                         best = Some(candidate);
