@@ -309,6 +309,66 @@ pub fn estimate_gain_band(
     GainBand { points }
 }
 
+/// Moderner Pre-Echo-Filter (LAME/Opus-inspiriert).
+///
+/// Im Gegensatz zum alten `estimate_gain_band` (3-7 Points pro Band,
+/// massiver Bit-Verbrauch) ist dieser Estimator extrem sparsam:
+/// - NUR bei echten starken Transienten (Onset-Ratio > 8×)
+/// - NUR in Bass-Bändern 0-1 (dort ist Pre-Echo am hörbarsten)
+/// - MAX 1 Gain-Point pro Band (12 bits statt bis zu 66 bits)
+/// - Silence-Gate: ignoriert leise Frames
+pub fn modern_gain_estimation(
+    current_envelope: &[f32; GAIN_HISTORY_SLOTS],
+    band_index: usize,
+) -> GainBand {
+    const ONSET_RATIO_THRESHOLD: f32 = 16.0;  // sehr konservativ: nur echte harte Transienten
+    const SILENCE_THRESHOLD: f32 = 1e-5;
+    const PRE_ONSET_GAIN_LEVEL: u8 = 5; // exponent=1 → scale=2× (sanfte Dämpfung, weniger MDCT-Verzerrung)
+
+    // Nur Bänder 0-1: HF-Pre-Echo ist psychoakustisch weniger relevant
+    if band_index >= 2 {
+        return GainBand::default();
+    }
+
+    // Envelope-basierte Energy pro Slot (squared = energy proxy)
+    let mut slot_energy = [0.0f32; GAIN_HISTORY_SLOTS];
+    let mut total_energy = 0.0f32;
+    for (i, &env) in current_envelope.iter().enumerate() {
+        slot_energy[i] = env * env;
+        total_energy += slot_energy[i];
+    }
+
+    // Silence-Gate
+    if total_energy < SILENCE_THRESHOLD {
+        return GainBand::default();
+    }
+
+    // Finde stärkstes Onset: max(E[k] / max(E[0..k-1]))
+    let mut running_max = slot_energy[0].max(1e-20);
+    let mut best_ratio = 0.0f32;
+    let mut best_slot = 0u8;
+    for k in 1..GAIN_HISTORY_SLOTS {
+        let ratio = slot_energy[k] / running_max;
+        if ratio > best_ratio {
+            best_ratio = ratio;
+            best_slot = k as u8;
+        }
+        running_max = running_max.max(slot_energy[k]);
+    }
+
+    // Nur bei starkem Onset: ein einzelner Gain-Point
+    if best_ratio > ONSET_RATIO_THRESHOLD {
+        GainBand {
+            points: vec![GainPoint {
+                level: PRE_ONSET_GAIN_LEVEL,
+                location: best_slot,
+            }],
+        }
+    } else {
+        GainBand::default()
+    }
+}
+
 fn band_history_slots(band_index: usize) -> usize {
     (8usize.saturating_sub(band_index.min(7))) * 8
 }

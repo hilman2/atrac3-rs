@@ -52,13 +52,21 @@ fn apply_odd_band_reverse() -> bool {
     *VALUE.get_or_init(|| env_flag("ATRAC3_ODD_REVERSE", DEFAULT_APPLY_ODD_BAND_REVERSE))
 }
 
-fn apply_gain_estimation() -> bool {
-    static VALUE: OnceLock<bool> = OnceLock::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GainMode { Off, Legacy, Modern }
+
+fn gain_mode() -> GainMode {
+    static VALUE: OnceLock<GainMode> = OnceLock::new();
     *VALUE.get_or_init(|| match env_choice("ATRAC3_GAIN").as_deref() {
-        Some("0" | "false" | "no" | "off") => false,
-        Some("1" | "true" | "yes" | "on") => true,
-        _ => DEFAULT_APPLY_GAIN_ESTIMATION,
+        Some("0" | "false" | "no" | "off") => GainMode::Off,
+        Some("1" | "true" | "yes" | "on" | "legacy") => GainMode::Legacy,
+        Some("modern") => GainMode::Modern,
+        _ => GainMode::Off, // Gain-Points deaktiviert — Pre-Echo via MDCT-Fading statt
     })
+}
+
+fn apply_gain_estimation() -> bool {
+    gain_mode() != GainMode::Off
 }
 
 fn analysis_sample_offset() -> isize {
@@ -613,15 +621,18 @@ impl PrototypeEncoder {
             envelopes[band_index] = envelope;
             let history_peak_state = self.previous_peak_state[channel_index][band_index];
 
-            let gain_band = if gain_enabled {
-                estimate_gain_band(
+            let gain_band = match gain_mode() {
+                GainMode::Legacy => estimate_gain_band(
                     &envelope,
                     &self.previous_envelopes[channel_index][band_index],
                     band_index,
                     history_peak_state,
-                )
-            } else {
-                GainBand::default()
+                ),
+                GainMode::Modern => {
+                    use super::gain::modern_gain_estimation;
+                    modern_gain_estimation(&envelope, band_index)
+                }
+                GainMode::Off => GainBand::default(),
             };
             gain_bands[band_index] = gain_band.clone();
 
@@ -644,8 +655,37 @@ impl PrototypeEncoder {
                 out
             };
 
+            // Pre-Echo-Filter: MDCT-Input-Fading (LAME-inspiriert).
+            // Statt Gain-Points (kosten Bits + Compensation zerstört MDCT)
+            // faden wir bei erkannten Transienten die Pre-Onset-Samples
+            // sanft auf den Overlap-Level. Kein Bit-Overhead, keine
+            // Decoder-Abhängigkeit.
+            let mut faded_samples = analysis_samples;
+            if band_index < 2 {
+                let mut slot_energy = [0.0f32; 8];
+                for (s, chunk) in faded_samples.chunks(32).enumerate() {
+                    if s >= 8 { break; }
+                    slot_energy[s] = chunk.iter().map(|c| c * c).sum();
+                }
+                let mut running_max = slot_energy[0].max(1e-20);
+                let mut best_ratio = 0.0f32;
+                let mut onset_slot = 0usize;
+                for k in 1..8 {
+                    let ratio = slot_energy[k] / running_max;
+                    if ratio > best_ratio { best_ratio = ratio; onset_slot = k; }
+                    running_max = running_max.max(slot_energy[k]);
+                }
+                if best_ratio > 12.0 && onset_slot >= 2 {
+                    let onset_sample = onset_slot * 32;
+                    for i in 0..onset_sample {
+                        let t = i as f32 / onset_sample as f32;
+                        let fade = t * t; // quadratic fade-in: sanft am Anfang, schnell vorm Onset
+                        faded_samples[i] *= fade;
+                    }
+                }
+            }
             let mdct_input = MdctInputVariant::from_env().build_input(
-                &analysis_samples,
+                &faded_samples,
                 &self.overlap[channel_index][band_index],
             );
             self.overlap[channel_index][band_index].copy_from_slice(&analysis_samples);
