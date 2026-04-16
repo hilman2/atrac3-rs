@@ -65,7 +65,13 @@ pub fn allocate(
     // pure silence).
     let mut num_active = 1usize;
     for b in 0..32 {
-        let audible = psycho.subband_energy_db[b] > psycho.ath_db[b] + 3.0;
+        // iter9: drop the ATH+3 headroom requirement and take ATH
+        // itself as the audibility threshold. The +3 was being
+        // over-conservative: it excluded bands that sat near hearing
+        // threshold but would still contribute to the perceived
+        // timbre, and those then counted as -inf dB deltas in the
+        // octave balance score.
+        let audible = psycho.subband_energy_db[b] > psycho.ath_db[b];
         if audible {
             num_active = b + 1;
         }
@@ -133,9 +139,20 @@ pub fn allocate(
             } else if b >= 28 {
                 w *= 0.5;
             } else if b >= 22 {
-                w *= 1.0;  // iter2: was 0.8 — Brilliance stays full weight
+                w *= 1.0;
             } else if b >= 16 {
                 w *= 1.3;
+            }
+        } else {
+            // iter7: on clean sources the Presence/Brilliance bands
+            // are real signal, not upstream noise. Boost them by 1.2
+            // so the RDO prioritises them against Mid on the margin.
+            // Measured gap to classic on classic_30s was dominated by
+            // NMR over mask + octave balance in exactly these bands.
+            if (22..=27).contains(&b) {
+                w *= 1.3;
+            } else if (16..=21).contains(&b) {
+                w *= 1.15;
             }
         }
         weights[b] = w;
@@ -166,12 +183,19 @@ pub fn allocate(
         //                              bits on pure noise.
         if b >= 30 {
             if headroom > 10.0 {
-                hf_floor[b] = 1;
+                hf_floor[b] = if !low_pass_source { 2 } else { 1 };
             }
         } else if b >= 28 {
             hf_floor[b] = if !low_pass_source && headroom > 12.0 { 2 } else { 1 };
+        } else if b >= 24 {
+            // iter6: split Brilliance in two halves.
+            //   24-27 (9.6-13.8 kHz): on clean tbl=3 (7 mantissa levels),
+            //                         matches Sony's air-band resolution
+            //   on lossy tbl=1.
+            hf_floor[b] = if !low_pass_source { 3 } else { 1 };
         } else if b >= 22 {
-            hf_floor[b] = 1;
+            //   22-23 (8.3-9.6 kHz): tbl=2 on clean, tbl=1 on lossy.
+            hf_floor[b] = if !low_pass_source { 2 } else { 1 };
         } else if b >= 16 {
             hf_floor[b] = 2;
         }
