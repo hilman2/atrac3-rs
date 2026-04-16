@@ -202,6 +202,57 @@ def hf_scope_events(x_ref, x_enc, sr, hf_lo=4000, hf_hi=16000):
     }
 
 
+def _find_transients_for_hole(x, sr, n_max=5, min_jump_db=2.0):
+    """Top-N strongest energy-jump transients, for HF-hole measurement."""
+    hop, win = 256, 1024
+    frames = (len(x) - win) // hop
+    if frames <= 0:
+        return []
+    env = np.array([np.sqrt(np.mean(x[i*hop:i*hop+win]**2)) for i in range(frames)])
+    env_db = 20 * np.log10(env + 1e-10)
+    cands = []
+    for i in range(2, len(env_db)):
+        jump = env_db[i] - env_db[i-1]
+        if jump > min_jump_db and env_db[i] > -40:
+            cands.append((i * hop, jump))
+    merge = int(0.15 * sr)
+    cands.sort(key=lambda c: -c[1])
+    picked = []
+    for pos, jump in cands:
+        if all(abs(pos - p) > merge for p, _ in picked):
+            picked.append((pos, jump))
+        if len(picked) >= n_max:
+            break
+    picked.sort(key=lambda c: c[0])
+    return [p for p, _ in picked]
+
+
+def _envelope_db(x, sr, hop_ms=2.0, win_ms=5.0):
+    hop = int(hop_ms * sr / 1000)
+    win = int(win_ms * sr / 1000)
+    n = max(1, (len(x) - win) // hop)
+    out = np.zeros(n)
+    for i in range(n):
+        seg = x[i*hop:i*hop+win]
+        out[i] = 20 * np.log10(np.sqrt(np.mean(seg**2)) + 1e-10)
+    t = np.arange(n) * hop_ms / 1000.0
+    return t, out
+
+
+def _hole_depth(ref_env, enc_env, t, attack_s, guard_ms=5.0, window_ms=150.0):
+    """Max dB drop of enc below ref in ±window_ms of attack, excluding
+    ±guard_ms around the attack. Returns a non-positive number."""
+    lo = attack_s - window_ms / 1000.0
+    hi = attack_s + window_ms / 1000.0
+    g_lo = attack_s - guard_ms / 1000.0
+    g_hi = attack_s + guard_ms / 1000.0
+    mask = ((t >= lo) & (t <= hi)) & ~((t >= g_lo) & (t <= g_hi))
+    if not mask.any():
+        return 0.0
+    delta = enc_env[mask] - ref_env[mask]
+    return float(delta.min())
+
+
 def _find_onsets(x, sr, threshold_db=4.0, min_gap_s=0.1):
     hop = 512; win = 2048
     frames = (len(x) - win) // hop
@@ -334,6 +385,11 @@ PEN_WEIGHTS = {
     'side_snr_deficit_db':  (0.4, 'Side-signal SNR deficit (dB)', 0.0),
     'width_shift_db':       (2.0, 'Stereo width shift',    0.3),
     'lr_corr_shift':        (3.0, 'L-R correlation shift', 0.02),
+    # Transient-neighbourhood HF hole — the audible "before/after the
+    # snare is a gap" artefact. Sony sits at ~1.3 dB, Frank/Classic at
+    # ~2.3-2.5, so a 1.5 dB tolerance catches the outliers without
+    # penalising acceptable encoders.
+    'snare_hf_hole_db':     (1.5, 'HF hole near transients (dB)', 1.5),
 }
 
 
@@ -439,6 +495,35 @@ def judge(ref_path, enc_path, label=None):
     # we count the shortfall as penalty.
     side_snr_deficit_db = max(0.0, 30.0 - side_snr_db)
 
+    # HF hole around transient onsets. Measures how much quieter the
+    # encoded 4-12 kHz band is compared to the reference in a ±150 ms
+    # window around each transient attack, excluding a ±5 ms guard
+    # around the attack itself. Classic/Frank drop 2-3 dB there on
+    # snares; Sony drops only 1-1.5 dB. Average the top three onsets
+    # so a single outlier doesn't drive the metric but a consistent
+    # issue does.
+    snare_hf_hole_db = 0.0
+    try:
+        onsets = _find_transients_for_hole(ref, sr_ref, n_max=5)
+        holes = []
+        for pos in onsets:
+            half = int(0.2 * sr_ref)
+            lo = max(0, pos - half); hi = min(len(ref), pos + half)
+            ref_seg = ref[lo:hi]; enc_seg = enc[lo:hi]
+            ref_hf = band_bandpass(ref_seg, sr_ref, 4000, min(sr_ref/2 - 1, 12000))
+            enc_hf = band_bandpass(enc_seg, sr_ref, 4000, min(sr_ref/2 - 1, 12000))
+            t_env, ref_hf_env = _envelope_db(ref_hf, sr_ref)
+            _,     enc_hf_env = _envelope_db(enc_hf, sr_ref)
+            h = _hole_depth(ref_hf_env, enc_hf_env, t_env, (pos - lo)/sr_ref)
+            holes.append(h)
+        if holes:
+            holes.sort()  # most negative first
+            top = holes[:3]
+            # we report the penalty as |mean of top-3 worst| (positive)
+            snare_hf_hole_db = abs(sum(top) / len(top))
+    except Exception:
+        pass
+
     terms = {
         'hf_bursts_per_10s':   hf_bursts_per_10s,
         'hf_pumping_per_10s':  hf_pumping_per_10s,
@@ -453,6 +538,7 @@ def judge(ref_path, enc_path, label=None):
         'side_snr_deficit_db': side_snr_deficit_db,
         'width_shift_db':      width_shift_db,
         'lr_corr_shift':       lr_corr_shift,
+        'snare_hf_hole_db':    snare_hf_hole_db,
     }
     breakdown = {}
     score = 0.0
@@ -466,7 +552,8 @@ def judge(ref_path, enc_path, label=None):
             if key in ('hf_bursts_per_10s', 'hf_pumping_per_10s',
                        'hf_holes_per_10s', 'pre_echo_per_10s',
                        'pre_echo_worst_db', 'octave_balance',
-                       'nmr_max_over', 'side_snr_deficit_db')
+                       'nmr_max_over', 'side_snr_deficit_db',
+                       'snare_hf_hole_db')
             else tol
         )
         excess = max(0.0, terms[key] - tol_source_adjusted)

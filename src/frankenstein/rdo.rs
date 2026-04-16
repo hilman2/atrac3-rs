@@ -113,10 +113,15 @@ pub fn allocate(
         let tonality_boost = 1.0 + psycho.tonality[b];
         let mut w = above_mask * tonality_boost;
 
+        // Previously: on transient frames, HF bands (≥16) were
+        // damped ×0.5 to reduce pre-echo ringing. Result (measured
+        // via transient_zoom.py on Crystallize90 snares): HF-hole of
+        // -2 to -3 dB vs the original in a ±150 ms window around
+        // every snare hit. Sony stays at -1.3 dB — it doesn't damp
+        // HF on transients. The user hears the difference as snare
+        // sizzle vanishing. Remove the damp.
         let qmf_band = (b / 8).min(3);
-        if psycho.transient_per_qmf[qmf_band] && b >= 16 {
-            w *= 0.5;
-        }
+        let _ = (qmf_band, psycho.transient_per_qmf);
         // Low-pass source (128 kbps MP3 etc.): upstream HF is mostly
         // quantiser noise. Shape the weights in four tiers — but
         // keeping in mind ATRAC3's non-uniform band layout!
