@@ -936,12 +936,12 @@ fn finalize_budget_solution(
     })
 }
 
-fn fixed_sound_unit_bits(subband_count: usize) -> usize {
+pub fn fixed_sound_unit_bits(subband_count: usize) -> usize {
     let coded_qmf_bands = coded_qmf_bands_for_subband_count(subband_count);
     6 + 2 + (coded_qmf_bands as usize * 3) + 5 + 5 + 1
 }
 
-fn candidate_total_bits(candidate: &QuantizedSubband) -> usize {
+pub fn candidate_total_bits(candidate: &QuantizedSubband) -> usize {
     3 + if candidate.table_index == 0 {
         0
     } else {
@@ -955,6 +955,14 @@ fn build_spectral_unit_budgeted(
     search: SearchOptions,
     target_bits: usize,
 ) -> Result<SpectrumEncoding> {
+    // Engine switch: when ATRAC3_ENGINE=frankenstein (or =1) is set,
+    // route through the new psychoacoustic + RDO pipeline instead of
+    // the classic Psycho-v2 + Sony-tricks allocator. See FRANKENSTEIN.md.
+    if crate::frankenstein::engine_is_frankenstein() {
+        return crate::frankenstein::build_spectral_unit_frankenstein(
+            coefficients, coding_mode, search, target_bits,
+        );
+    }
     ensure!(
         coefficients.len() == SAMPLES_PER_FRAME,
         "expected {} coefficients, got {}",
@@ -1491,7 +1499,7 @@ fn build_spectral_unit_budgeted(
     })
 }
 
-fn quantize_subband(
+pub fn quantize_subband(
     coefficients: &[f32],
     selector: u8,
     scale_factor_index: u8,
