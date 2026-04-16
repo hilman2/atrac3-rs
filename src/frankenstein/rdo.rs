@@ -111,13 +111,31 @@ pub fn allocate(
         if psycho.transient_per_qmf[qmf_band] && b >= 16 {
             w *= 0.5;
         }
-        // Low-pass source: heavily dampen bins above ~16 kHz and
-        // fade-out Presence above what's really there.
+        // Low-pass source (128 kbps MP3 etc.): upstream HF is mostly
+        // quantiser noise. Shape the weights in four tiers — but
+        // keeping in mind ATRAC3's non-uniform band layout!
+        //   Band 16-19 ≈  4.1 -  6.2 kHz  — VOCAL CLARITY (Presence)
+        //   Band 20-21 ≈  6.2 -  8.3 kHz  — VOCAL SIBILANCE
+        //   Band 22-27 ≈  8.3 - 13.8 kHz  — Brilliance
+        //   Band 28-29 ≈ 13.8 - 15.1 kHz  — top Brilliance
+        //   Band 30-31 ≈ 16.5 - 22.0 kHz  — Air
+        //
+        //  - Air (≥ 30):             ×0.05 — pure upstream noise, toss.
+        //  - Upper Brilliance (28+): ×0.3  — residual; whisper.
+        //  - Brilliance (22-27):     ×0.8  — keep it, slightly demote.
+        //  - Vocal range (16-21):    ×1.3  — BOOST. Presence + sibilance.
+        //    Without this voices sound noticeably "dumpfer" than classic;
+        //    measured via waveform_dive.py with -0.7 dB in the 4-6 kHz
+        //    band even when the rest of the spectrum matches.
         if low_pass_source {
-            if b >= 28 {
-                w *= 0.1;
+            if b >= 30 {
+                w *= 0.05;
+            } else if b >= 28 {
+                w *= 0.3;
             } else if b >= 22 {
-                w *= 0.5;
+                w *= 0.8;
+            } else if b >= 16 {
+                w *= 1.3;
             }
         }
         weights[b] = w;
@@ -129,24 +147,41 @@ pub fn allocate(
     // Mirrors classic's MIN_TBL intent but is now driven by psycho's
     // ATH headroom rather than a hard-coded band index.
     let mut hf_floor = [0u8; 32];
-    // Low-pass sources get no HF floor at all — the "HF" is junk from
-    // the upstream codec, so forcing bits there is purely wasteful.
-    if !low_pass_source {
-        for b in 0..num_active {
-            let headroom = psycho.subband_energy_db[b] - psycho.ath_db[b];
-            // Two-tier HF floor driven by ATH headroom:
-            //  - Brilliance (≥ 28): tbl ≥ 2 → 5 mantissa levels, enough
-            //    to track the air band's envelope vs the three-level grid.
-            //  - Presence top / Upper-Mid (≥ 22): tbl ≥ 1 → band stays
-            //    coded at all, prevents the RDO from dropping it to
-            //    silence when an LF band looks more efficient.
-            if headroom > 12.0 {
-                if b >= 28 {
-                    hf_floor[b] = 2;
-                } else if b >= 22 {
-                    hf_floor[b] = 1;
-                }
+    for b in 0..num_active {
+        let headroom = psycho.subband_energy_db[b] - psycho.ath_db[b];
+        if headroom <= 6.0 {
+            continue;
+        }
+        // Layered floors, tuned from vocal-clarity measurements:
+        //
+        //   Band 16-21 (≈ 4.1-8.3 kHz): VOCAL-CLARITY FLOOR.
+        //     Always floor to tbl ≥ 1. Sibilance and vocal presence
+        //     live here. Without this, voices measure 0.7 dB below
+        //     reference in the 4-6 kHz band and are perceived as
+        //     "dumpfer" than classic's output (verified with
+        //     tools/waveform_dive.py on a 128 kbps MP3 re-encode).
+        //
+        //   Band 22-27 (≈ 8.3-13.8 kHz): clean-source only, tbl ≥ 1.
+        //     Low-pass sources leave this band to the RDO / weight
+        //     dampener — it's usually upstream quantiser noise there.
+        //
+        //   Band 28+ (≈ 13.8+ kHz): Brilliance floor tbl ≥ 2 on
+        //     clean sources; disabled on low-pass sources where the
+        //     band carries no real information.
+        if b >= 28 {
+            if !low_pass_source && headroom > 12.0 {
+                hf_floor[b] = 2;
             }
+        } else if b >= 22 {
+            if !low_pass_source && headroom > 12.0 {
+                hf_floor[b] = 1;
+            }
+        } else if b >= 16 {
+            // Vocal-clarity floor. tbl=2 (5 mantissa levels) rather
+            // than tbl=1 (3 levels) — sibilance and breath need the
+            // extra resolution to avoid "kantig" reconstruction.
+            // Costs ~5-8 bits per band, budget allows it.
+            hf_floor[b] = 2;
         }
     }
 
