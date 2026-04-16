@@ -1063,10 +1063,15 @@ fn build_spectral_unit_budgeted(
         // v3g sfIndex-Bump: HF-Bänder bekommen höheren Start-Delta und MSE-
         // Kriterium statt max_abs_err. Gröbere Steps → mehr Mantissa=0 → weniger
         // Noise-Power → natürlicherer HF-Sound (Sony's 64% statt 121%).
-        let (start_delta, max_delta) = if band >= 26 && band_peak_sf[band] < 12 {
-            (2i8, 6i8)
-        } else if band >= 20 && band_peak_sf[band] < 18 {
-            (1i8, 5i8)
+        // sfIndex-Bump für HF: sweet-spot zwischen weniger Noise (SNR↑) und
+        // erhaltener Korrelation (HF-Corr stabil). Zu aggressiv zerstört
+        // Waveform, zu konservativ lässt Noise durch.
+        let (start_delta, max_delta) = if band >= 28 {
+            (2i8, 5i8)  // Brilliance
+        } else if band >= 22 {
+            (1i8, 4i8)  // Presence/Upper-Mid
+        } else if band >= 20 {
+            (1i8, 3i8)  // Upper-Mid entry
         } else {
             (0i8, 3i8)
         };
