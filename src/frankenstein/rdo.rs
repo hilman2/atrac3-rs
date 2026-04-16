@@ -92,6 +92,14 @@ pub fn allocate(
     //    coefficients ringing before the attack. Slightly coarser HF
     //    in transient frames trades a tiny SNR hit for big pre-echo
     //    reduction.
+    // Input-aware gate: if the frame's HF energy ratio is vanishingly
+    // small, the source was almost certainly low-passed upstream
+    // (typically 128 kbps MP3). Spending bits on its "HF" is just
+    // preserving the previous codec's quantiser noise. We detect
+    // per-frame and redirect the budget to Mid/Presence where the
+    // real music lives.
+    let low_pass_source = psycho.hf_energy_ratio < 0.001;
+
     let mut weights = [0.0_f32; 32];
     for b in 0..num_active {
         let smr = psycho.subband_energy_db[b] - psycho.subband_mask_db[b];
@@ -103,6 +111,15 @@ pub fn allocate(
         if psycho.transient_per_qmf[qmf_band] && b >= 16 {
             w *= 0.5;
         }
+        // Low-pass source: heavily dampen bins above ~16 kHz and
+        // fade-out Presence above what's really there.
+        if low_pass_source {
+            if b >= 28 {
+                w *= 0.1;
+            } else if b >= 22 {
+                w *= 0.5;
+            }
+        }
         weights[b] = w;
     }
 
@@ -112,13 +129,23 @@ pub fn allocate(
     // Mirrors classic's MIN_TBL intent but is now driven by psycho's
     // ATH headroom rather than a hard-coded band index.
     let mut hf_floor = [0u8; 32];
-    for b in 0..num_active {
-        let headroom = psycho.subband_energy_db[b] - psycho.ath_db[b];
-        if headroom > 12.0 {
-            if b >= 28 {
-                hf_floor[b] = 2;   // Brilliance — 5 mantissa levels
-            } else if b >= 22 {
-                hf_floor[b] = 1;   // Presence + Upper-Mid top
+    // Low-pass sources get no HF floor at all — the "HF" is junk from
+    // the upstream codec, so forcing bits there is purely wasteful.
+    if !low_pass_source {
+        for b in 0..num_active {
+            let headroom = psycho.subband_energy_db[b] - psycho.ath_db[b];
+            // Two-tier HF floor driven by ATH headroom:
+            //  - Brilliance (≥ 28): tbl ≥ 2 → 5 mantissa levels, enough
+            //    to track the air band's envelope vs the three-level grid.
+            //  - Presence top / Upper-Mid (≥ 22): tbl ≥ 1 → band stays
+            //    coded at all, prevents the RDO from dropping it to
+            //    silence when an LF band looks more efficient.
+            if headroom > 12.0 {
+                if b >= 28 {
+                    hf_floor[b] = 2;
+                } else if b >= 22 {
+                    hf_floor[b] = 1;
+                }
             }
         }
     }

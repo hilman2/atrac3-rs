@@ -63,6 +63,12 @@ pub struct PsychoDrive {
     /// budget is below this, the allocator must accept audible noise
     /// somewhere.
     pub pe_required_bits: f32,
+    /// Fraction of total frame energy that sits above ~16 kHz (bin
+    /// 768+). A very low ratio flags a low-pass source (typical of
+    /// 128 kbps MP3 re-encodes, FM rips, etc.); the allocator then
+    /// stops spending bits on HF that is mostly quantiser noise from
+    /// the previous codec.
+    pub hf_energy_ratio: f32,
 }
 
 /// Compute the psychoacoustic analysis for a full frame of MDCT
@@ -105,6 +111,22 @@ pub fn compute(coefficients: &[f32], sample_rate: u32) -> PsychoDrive {
 
     let transient_per_qmf = detect_transients(coefficients);
 
+    // HF-quality flag: sum the MDCT coefficient energies of bins ≥ 768
+    // (roughly 16 kHz+) and compare to total energy. A MP3 @ 128 kbps
+    // low-passes at ~16 kHz, so its re-encoded HF is almost pure
+    // quantiser noise; the ratio drops by ~100× compared to a
+    // clean source.
+    let mut hf_energy = 0.0_f64;
+    let mut total_energy = 1e-20_f64;
+    for (i, &c) in coefficients.iter().enumerate() {
+        let e = (c as f64) * (c as f64);
+        total_energy += e;
+        if i >= 768 {
+            hf_energy += e;
+        }
+    }
+    let hf_energy_ratio = (hf_energy / total_energy) as f32;
+
     PsychoDrive {
         bark_energy_db: bark_e_db,
         subband_mask_db,
@@ -113,6 +135,7 @@ pub fn compute(coefficients: &[f32], sample_rate: u32) -> PsychoDrive {
         ath_db,
         transient_per_qmf,
         pe_required_bits: pe,
+        hf_energy_ratio,
     }
 }
 
