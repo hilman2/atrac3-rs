@@ -529,7 +529,37 @@ impl PrototypeEncoder {
                 Some(spectral_budget.saturating_sub(tonal_result.tonal_bits));
             adjusted_search.tonal_marked_subbands = tonal_result.tonal_subbands;
 
-            let mut spectrum = build_spectral_unit(&residual, coding_mode, adjusted_search)?;
+            // 2-Pass Encoding: Pass 1 encodiert mit geschätztem Budget.
+            // Dann messen wir ECHTE Bits → surplus. Pass 2 re-encodiert
+            // mit target_bits += surplus → nutzt das volle 192-byte Budget.
+            // Kosten: 2× quantize (~0.3s extra pro 3min Song). Lohnt sich:
+            // Sony nutzt 178/192 bytes, wir nur 160/192 → 18 bytes verschwendet.
+            let pass1_spectrum = build_spectral_unit(&residual, coding_mode, adjusted_search)?;
+            let pass1_bits = {
+                let mut su = build_basic_sound_unit_from_encoding(&pass1_spectrum);
+                su.coded_qmf_bands = su.coded_qmf_bands.min(coded_qmf_target) as u8;
+                su.gain_bands = analysis.gain_bands[..su.coded_qmf_bands as usize].to_vec();
+                su.tonal_mode_selector = tonal_result.tonal_mode_selector;
+                su.tonal_components = tonal_result.tonal_components.clone().into_iter().map(|mut c| {
+                    c.band_flags.resize(su.coded_qmf_bands as usize, false);
+                    c.cells.resize(su.coded_qmf_bands as usize * 4, crate::atrac3::sound_unit::TonalCell::default());
+                    c
+                }).collect();
+                let mut w = BitWriter::new();
+                let _ = su.write_to(&mut w);
+                w.bit_len()
+            };
+            let pass1_surplus = base_target.saturating_sub(pass1_bits);
+            // Pass 2: wenn >30 bits surplus, re-encode mit größerem Budget
+            let mut spectrum = if pass1_surplus > 30 {
+                let mut pass2_search = adjusted_search;
+                pass2_search.target_bits = Some(
+                    adjusted_search.target_bits.unwrap_or(1536) + pass1_surplus - 10
+                );
+                build_spectral_unit(&residual, coding_mode, pass2_search)?
+            } else {
+                pass1_spectrum
+            };
             pad_spectral_unit(&mut spectrum, min_subband_count);
             let mut sound_unit = build_basic_sound_unit_from_encoding(&spectrum);
             let coded_qmf_bands = sound_unit.coded_qmf_bands.min(coded_qmf_target) as usize;
