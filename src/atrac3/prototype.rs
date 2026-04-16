@@ -316,46 +316,107 @@ impl PrototypeEncoder {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // ANALYSE: pro Frame/Kanal messe echte Bits + Pre-Echo-Risk
-        struct FrameAnalysis {
+        // ANALYSE: aus Pass 1 lernen — drei Insights pro Frame:
+        // 1. Surplus: wie viele Bits wurden NICHT genutzt → Budget für Pass 2
+        // 2. Pre-Echo: welche Frames haben Transient-Onset im Folge-Frame
+        // 3. HF-Power-Ratio: wo produziert der Quantizer zu viel Noise
+        struct FrameInsight {
             surplus_bits: usize,
-            has_pre_echo_risk: bool,
+            pre_echo_risk: bool,
+            hf_noise_ratio: f32, // encoded_hf_power / original_hf_power
         }
-        let analyses_p1: Vec<Vec<FrameAnalysis>> = pass1_frames
+        let insights: Vec<Vec<FrameInsight>> = pass1_frames
             .iter()
             .enumerate()
             .map(|(idx, frame)| {
                 frame.channels.iter().enumerate().map(|(ch, channel)| {
                     let surplus = base_target.saturating_sub(channel.bit_len);
-                    // Pre-Echo-Risk: nächster Frame hat viel mehr Energie
-                    let has_risk = if idx + 1 < all_analyses.len() {
-                        let cur_e: f32 = all_analyses[idx][ch].coefficients.iter()
+                    // Pre-Echo: nächster Frame > 8× lauter
+                    let pre_echo_risk = if idx + 1 < all_analyses.len() {
+                        let cur_e: f32 = all_analyses[idx][ch].coefficients[..512].iter()
                             .map(|c| c * c).sum();
                         let next_e: f32 = all_analyses[(idx + 1).min(all_analyses.len()-1)][ch]
-                            .coefficients.iter().map(|c| c * c).sum();
+                            .coefficients[..512].iter().map(|c| c * c).sum();
                         next_e > cur_e * 8.0
                     } else { false };
-                    FrameAnalysis { surplus_bits: surplus, has_pre_echo_risk: has_risk }
+                    // HF Power Ratio: rekonstruierte HF vs Original-HF
+                    let orig_hf: f32 = all_analyses[idx][ch].coefficients[512..].iter()
+                        .map(|c| c * c).sum::<f32>().max(1e-20);
+                    let enc_hf: f32 = channel.spectrum.reconstructed.get(512..)
+                        .map(|s| s.iter().map(|c| c * c).sum()).unwrap_or(0.0f32);
+                    let hf_noise_ratio = enc_hf / orig_hf;
+                    FrameInsight { surplus_bits: surplus, pre_echo_risk, hf_noise_ratio }
                 }).collect()
             })
             .collect();
 
-        // PASS 2: Re-encode mit per-Frame optimiertem Budget
+        // PASS 2: Re-encode JEDES Frame mit Wissen aus Pass 1
         let frames: Vec<PrototypeFrame> = all_analyses
             .par_iter()
             .enumerate()
             .map(|(idx, analyses)| {
-                let max_surplus = analyses_p1[idx].iter()
+                let max_surplus = insights[idx].iter()
                     .map(|a| a.surplus_bits).max().unwrap_or(0);
-                let any_pre_echo = analyses_p1[idx].iter().any(|a| a.has_pre_echo_risk);
+                let any_pre_echo = insights[idx].iter().any(|a| a.pre_echo_risk);
+                let max_hf_ratio = insights[idx].iter()
+                    .map(|a| a.hf_noise_ratio).fold(0.0f32, f32::max);
 
-                if max_surplus > 30 || any_pre_echo {
+                // Entscheide ob Pass 2 lohnt
+                let needs_pass2 = max_surplus > 20
+                    || any_pre_echo
+                    || max_hf_ratio > 1.2; // HF zu laut → Floor-Sub aggressiver
+
+                if needs_pass2 {
+                    // Pass-2-optimierte Coefficients: Pre-Echo-Fading verstärken
+                    // + HF-Floor-Subtraction anpassen basierend auf Pass-1-Ratio
+                    let mut pass2_analyses: Vec<AnalyzedChannel> = analyses.clone();
+                    for (ch, analysis) in pass2_analyses.iter_mut().enumerate() {
+                        let insight = &insights[idx][ch];
+
+                        // Pre-Echo: wenn nächster Frame laut wird, stärkeres Fading
+                        // auf Band 0-1 im aktuellen Frame
+                        if insight.pre_echo_risk {
+                            for band_idx in 0..2 {
+                                let s = band_idx * 256;
+                                let e = s + 256;
+                                if e > analysis.coefficients.len() { break; }
+                                // Letzte 64 Coefs (= letzte 2 Slots) sanft faden
+                                for i in (e-64)..e {
+                                    let t = (e - i) as f32 / 64.0;
+                                    analysis.coefficients[i] *= t * t;
+                                }
+                            }
+                        }
+
+                        // HF-Noise: wenn Pass 1 >120% HF-Power produziert hat,
+                        // Floor-Subtraction in Pass 2 aggressiver machen
+                        if insight.hf_noise_ratio > 1.2 {
+                            let extra_alpha = (insight.hf_noise_ratio - 1.0).min(1.5);
+                            for band in 20..32 {
+                                let s = ATRAC3_SUBBAND_TAB[band];
+                                let e = ATRAC3_SUBBAND_TAB[band + 1];
+                                if e > analysis.coefficients.len() { break; }
+                                let mut mags: Vec<f32> = analysis.coefficients[s..e].iter()
+                                    .map(|c| c.abs()).collect();
+                                mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                                let floor = mags[mags.len() / 4]; // 25th percentile
+                                let threshold = floor * extra_alpha;
+                                for c in analysis.coefficients[s..e].iter_mut() {
+                                    let mag = c.abs();
+                                    if mag <= threshold {
+                                        *c = 0.0;
+                                    } else {
+                                        *c = c.signum() * (mag - threshold);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let mut pass2_search = search_opts;
-                    // Surplus in extra Budget umwandeln (konservativ /3)
-                    let extra = max_surplus / 3;
-                    pass2_search.target_bits = Some(base_target + extra);
+                    pass2_search.target_bits = Some(base_target + max_surplus / 3);
 
-                    match encoder.encode_analyzed_frame(analyses, options.coding_mode, pass2_search) {
+                    match encoder.encode_analyzed_frame(&pass2_analyses, options.coding_mode, pass2_search) {
                         Ok(f) if f.channels.iter().all(|ch| ch.bytes.len() <= 192) => Ok(f),
                         _ => Ok(pass1_frames[idx].clone()),
                     }
