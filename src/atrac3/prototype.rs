@@ -445,6 +445,38 @@ impl PrototypeEncoder {
                 }
             }
 
+            // Vorbis-Trick: Bark-Scale Psychoacoustic Masking Model.
+            //
+            // Berechne pro Band die Masking-Threshold: wie viel Noise wird
+            // durch benachbarte Bänder verdeckt? Starkes LF-Signal maskiert
+            // HF-Noise (forward masking über Bark-Scale). Das Ergebnis
+            // bestimmt wie aggressiv der Spectral-Floor-Subtractor arbeitet:
+            // - Hohe Masking → Noise wird verdeckt → aggressiver filtern (spart Bits)
+            // - Niedrige Masking → Noise ist hörbar → sanfter filtern (erhält Signal)
+            //
+            // Simplified Bark-Scale Spreading: jedes Band breitet seine Energie
+            // um 3 dB/Bark nach oben und 1.5 dB/Bark nach unten aus.
+            let mut band_power = [0.0f32; 32];
+            let mut masking_threshold = [0.0f32; 32];
+            for band in 0..32 {
+                let s = ATRAC3_SUBBAND_TAB[band];
+                let e = ATRAC3_SUBBAND_TAB[band + 1];
+                if e > residual.len() { break; }
+                band_power[band] = residual[s..e].iter()
+                    .map(|c| c * c).sum::<f32>() / (e - s).max(1) as f32;
+            }
+            // Forward masking: LF→HF spreading (dominanter Effekt)
+            for band in 0..32 {
+                let mut mask = band_power[band] * 0.001; // self-masking: -30 dB
+                // Spread from lower bands (forward masking)
+                for lower in 0..band {
+                    let bark_dist = (band - lower) as f32 * 0.5; // ~0.5 Bark pro ATRAC3-Band
+                    let spread = band_power[lower] * 10.0f32.powf(-0.3 * bark_dist); // 3 dB/Bark
+                    mask = mask.max(spread * 0.001); // masking threshold = -30 dB below masker
+                }
+                masking_threshold[band] = mask;
+            }
+
             // Spectral-Floor-Subtraction (klassisches Denoising):
             //
             // Pro HF-Band: schätze den Noise-Floor als Median der |Coefs|.
@@ -470,10 +502,16 @@ impl PrototypeEncoder {
                 let floor_idx = width / 4; // 25th percentile
                 let noise_floor = mags[floor_idx];
                 if noise_floor < 1e-12 { continue; }
-                // Stärke adaptiv: HF aggressiver als Mid
-                let alpha = if band >= 28 { 1.5f32 }   // Brilliance: 150% Floor
-                    else if band >= 22 { 0.7 }           // Presence: 70% (Stimmen schonen)
-                    else { 0.4 };                         // Upper-Mid: 40% (minimal)
+                // Masking-aware Threshold: wenn starkes Masking aktiv, aggressiver
+                // filtern (Noise wird verdeckt). Ohne Masking: konservativ.
+                let masking_ratio = if band_power[band] > 1e-20 {
+                    (masking_threshold[band] / band_power[band]).sqrt().clamp(0.0, 1.0)
+                } else { 0.0 };
+                // Basis-Alpha + Masking-Boost
+                let base_alpha = if band >= 28 { 1.0f32 }
+                    else if band >= 22 { 0.5 }
+                    else { 0.3 };
+                let alpha = base_alpha + masking_ratio * 1.5; // stärker wenn maskiert
                 let threshold = noise_floor * alpha;
                 // Soft-Threshold Subtraction
                 for coef in residual[s..e].iter_mut() {
