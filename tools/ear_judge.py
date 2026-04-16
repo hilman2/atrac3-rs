@@ -233,50 +233,78 @@ def source_health(x, sr):
     """Classify the reference itself so we don't punish the encoder for
     what the source is missing.
 
-    Returns a dict with:
-      hf_energy_db          — 14-22 kHz RMS vs full-band RMS, in dB
-      spectral_flatness_hf  — SFM of 4-16 kHz frames, 0-1
-      class                 — 'clean' | 'lossy_mild' | 'lossy_severe'
-      tolerance_mult        — multiplier applied to every penalty's
-                              tolerance band. lossy_severe = 2.0 ×
-                              (can't recover what isn't there).
+    Three independent indicators, combined into one class:
+
+    1. hf_energy_db   — 14-22 kHz RMS vs full-band RMS, in dB.
+                        Electronic genres naturally sit low here, so
+                        alone this is genre-biased.
+
+    2. sfm_hf         — spectral flatness of 4-16 kHz frames.
+                        MP3-style quantiser noise is flat (SFM → 1).
+                        Real HF with structure has peaks (SFM → 0).
+                        A high SFM combined with low HF energy is a
+                        strong MP3 fingerprint.
+
+    3. cliff_slope_db — difference of band energy across the canonical
+                        MP3 low-pass cliff (~15-17 kHz vs 18-20 kHz).
+                        A sharp drop > 15 dB is the classic 128 kbps
+                        MP3 brickwall.
+
+    Decision: start with the HF-energy tier, then upgrade to severe if
+    SFM is high or the cliff is steep (both indicate lossy upstream).
+    Downgrade to clean if SFM is low (tonal HF) even when HF energy is
+    modest — that rescues Electronic genres with natural low-ish air.
     """
-    full = 20 * np.log10(np.sqrt(np.mean(x**2) + 1e-20))
+    full_rms = np.sqrt(np.mean(x**2) + 1e-20)
+    full_db = 20 * np.log10(full_rms)
     air = band_bandpass(x, sr, 14000, min(sr/2 - 1, 22000))
     air_db = 20 * np.log10(np.sqrt(np.mean(air**2) + 1e-20))
-    hf_energy_db = air_db - full
+    hf_energy_db = air_db - full_db
 
-    # SFM in 4-16 kHz: tonal content vs noise. Lossy encoders (MP3)
-    # leave the HF flattish noise; clean sources have structure there.
+    # SFM in 4-16 kHz
     win = 2048
     w = np.hanning(win)
     freqs = np.fft.rfftfreq(win, 1.0/sr)
-    mask = (freqs >= 4000) & (freqs <= min(16000, sr/2-1))
+    mask_hf = (freqs >= 4000) & (freqs <= min(16000, sr/2 - 1))
     sfm_vals = []
     for i in range(0, len(x) - win, win):
         S = np.abs(np.fft.rfft(x[i:i+win] * w)) ** 2 + 1e-20
-        band = S[mask]
+        band = S[mask_hf]
         gm = np.exp(np.mean(np.log(band)))
         am = np.mean(band)
         sfm_vals.append(gm / am)
     sfm_hf = float(np.mean(sfm_vals)) if sfm_vals else 1.0
 
-    # Class thresholds: 14-22 kHz RMS 30 dB below full is "essentially
-    # silent" (MP3 128 kbps low-pass). 20-30 dB is mild. Above that is
-    # clean.
-    if hf_energy_db < -30:
-        cls = 'lossy_severe'
-        tmult = 2.0
-    elif hf_energy_db < -22:
-        cls = 'lossy_mild'
-        tmult = 1.3
+    # Cliff detection: 15-17 kHz vs 18-20 kHz RMS delta.
+    # MP3 128 kbps has a ~15-17 kHz cutoff, so there's a steep fall
+    # (> 15 dB) right there. Natural sources have a gentle roll-off.
+    pre_cliff = band_bandpass(x, sr, 15000, 17000)
+    post_cliff = band_bandpass(x, sr, 18000, min(20000, sr/2 - 1))
+    pre_db = 20 * np.log10(np.sqrt(np.mean(pre_cliff**2) + 1e-20))
+    post_db = 20 * np.log10(np.sqrt(np.mean(post_cliff**2) + 1e-20))
+    cliff_slope_db = pre_db - post_db
+
+    # Fusion rule, ordered most-to-least trusted:
+    #  * cliff > 25 dB     → lossy_severe (classic MP3 low-pass)
+    #  * hf_energy < -35   → lossy_severe regardless of SFM
+    #  * hf_energy < -25 and sfm_hf > 0.3 → lossy_mild (flat HF noise)
+    #  * sfm_hf < 0.1      → clean (tonal HF implies real source)
+    #  * otherwise         → fall back on HF energy tier
+    if cliff_slope_db > 25.0 or hf_energy_db < -35.0:
+        cls, tmult = 'lossy_severe', 2.0
+    elif sfm_hf < 0.1 and hf_energy_db > -35.0:
+        # Strongly tonal HF: Electronic / Classical / studio material.
+        # Treat as clean even if the HF RMS is modest.
+        cls, tmult = 'clean', 1.0
+    elif hf_energy_db < -28.0 or sfm_hf > 0.35:
+        cls, tmult = 'lossy_mild', 1.3
     else:
-        cls = 'clean'
-        tmult = 1.0
+        cls, tmult = 'clean', 1.0
 
     return {
         'hf_energy_db': float(hf_energy_db),
         'spectral_flatness_hf': sfm_hf,
+        'cliff_slope_db': float(cliff_slope_db),
         'class': cls,
         'tolerance_mult': tmult,
     }
@@ -420,6 +448,8 @@ def judge(ref_path, enc_path, label=None):
         'duration_s': float(duration_s),
         'source_class': src['class'],
         'source_hf_energy_db': src['hf_energy_db'],
+        'source_sfm_hf': src['spectral_flatness_hf'],
+        'source_cliff_slope_db': src['cliff_slope_db'],
         'source_tolerance_mult': src['tolerance_mult'],
         'score': float(score),
         'verdict': verdict,
@@ -442,6 +472,7 @@ def print_report(result):
     print('='*72)
     print(f"{'SCORE':<20s}  {result['score']:>6.2f}   [{result['verdict'].upper()}]")
     print(f"{'source':<20s}  {result['source_class']:<14s}  HF={result['source_hf_energy_db']:+.1f} dB  "
+          f"SFM={result['source_sfm_hf']:.2f}  cliff={result['source_cliff_slope_db']:+.1f} dB  "
           f"tolerance×{result['source_tolerance_mult']:.1f}")
     print(f"{'context':<20s}  overall SNR {result['context']['overall_snr_db']:+.2f} dB · "
           f"HF SNR {result['context']['hf_snr_db']:+.2f} dB")
@@ -479,6 +510,7 @@ def compare(ref_path, enc_paths, labels=None):
     # Source context in the comparison header.
     first = results_sorted[0]
     print(f"source: {first['source_class']:<12s}  HF={first['source_hf_energy_db']:+.1f} dB  "
+          f"SFM={first['source_sfm_hf']:.2f}  cliff={first['source_cliff_slope_db']:+.1f}  "
           f"tolerance×{first['source_tolerance_mult']:.1f}")
     print()
     print(f"{'rank':<5s} {'label':<20s} {'score':>8s}  {'verdict':<14s} {'SNR':>7s} {'HF-SNR':>7s} {'voc':>6s}  {'hf-art':>7s}")
