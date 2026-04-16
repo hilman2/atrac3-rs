@@ -321,14 +321,22 @@ pub fn modern_gain_estimation(
     current_envelope: &[f32; GAIN_HISTORY_SLOTS],
     band_index: usize,
 ) -> GainBand {
-    const ONSET_RATIO_THRESHOLD: f32 = 16.0;  // sehr konservativ: nur echte harte Transienten
+    // v32 tried extending this to HF bands (2, 3) with lower onset
+    // thresholds to catch snare/sizzle transients. Bench sum went
+    // from 35.61 to 47.47 across all four samples; the extra gain-
+    // points cost 9 bits each without reducing the measured HF-hole
+    // (-3.0 dB stayed -3.0 dB on Crystallize snares). Rolled back.
+    // The HF-hole is either not primarily a gain-envelope problem,
+    // or modern's onset detector is not picking up on the right
+    // events in our test material.
+    const ONSET_RATIO_THRESHOLD: f32 = 16.0;
     const SILENCE_THRESHOLD: f32 = 1e-5;
-    const PRE_ONSET_GAIN_LEVEL: u8 = 5; // exponent=1 → scale=2× (sanfte Dämpfung, weniger MDCT-Verzerrung)
-
-    // Nur Bänder 0-1: HF-Pre-Echo ist psychoakustisch weniger relevant
+    const PRE_ONSET_GAIN_LEVEL: u8 = 5;
     if band_index >= 2 {
         return GainBand::default();
     }
+    let onset_ratio = ONSET_RATIO_THRESHOLD;
+    let pre_gain_level = PRE_ONSET_GAIN_LEVEL;
 
     // Envelope-basierte Energy pro Slot (squared = energy proxy)
     let mut slot_energy = [0.0f32; GAIN_HISTORY_SLOTS];
@@ -357,10 +365,10 @@ pub fn modern_gain_estimation(
     }
 
     // Nur bei starkem Onset: ein einzelner Gain-Point
-    if best_ratio > ONSET_RATIO_THRESHOLD {
+    if best_ratio > onset_ratio {
         GainBand {
             points: vec![GainPoint {
-                level: PRE_ONSET_GAIN_LEVEL,
+                level: pre_gain_level,
                 location: best_slot,
             }],
         }
