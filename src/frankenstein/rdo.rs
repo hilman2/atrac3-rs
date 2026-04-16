@@ -212,11 +212,37 @@ pub fn allocate(
         eprintln!("[frank] transients={:?}", psycho.transient_per_qmf);
     }
 
-    let (tbl_choice, sf_choice, used_bits) =
+    let (mut tbl_choice, mut sf_choice, mut used_bits) =
         lambda_search(&candidates, &weights, &hf_floor, num_active, available);
 
     if debug {
         eprintln!("[frank] after λ: used={}/{} tbls={:?}",
+            used_bits, available, &tbl_choice[..num_active]);
+    }
+
+    // --- Robin Hood swap pass (Classic-inspired) ---
+    // The λ-search lands on a single (tbl, sf) per band that balances
+    // bits-vs-mse globally. But because the tbl ladder is coarse (five
+    // quant levels per step), a band that just missed the next tbl up
+    // might gain a lot of mse quality for few extra bits, while an
+    // overserved band upstairs would lose little quality for the same
+    // bits back. Classic's equivalent is `robin_pass` in
+    // atrac3/quant.rs. We do the same thing here, but the swap figure
+    // of merit uses the perceptual weight:
+    //
+    //     gain_per_bit(promote) = Δmse × w / Δbits
+    //     loss_per_bit(demote)  = Δmse × w / |Δbits|
+    //
+    // and we swap if promote_gain > demote_loss + ε. This empties
+    // bits from over-masked bands into ones still poking above the
+    // mask curve.
+    robin_hood_swaps(
+        &candidates, &weights, &hf_floor, num_active,
+        &mut tbl_choice, &mut sf_choice, &mut used_bits, available,
+    );
+
+    if debug {
+        eprintln!("[frank] after robin: used={}/{} tbls={:?}",
             used_bits, available, &tbl_choice[..num_active]);
     }
 
@@ -386,6 +412,155 @@ fn lambda_search(
     }
     best
 }
+
+/// Robin Hood. Per pass: promote the band that would gain most
+/// weighted mse-per-bit from a tbl bump, demote the band that would
+/// lose least from a tbl drop. Swap only if the net (gain − loss) is
+/// positive, which guarantees monotonic improvement in the weighted
+/// mse cost. Respects `hf_floor` so protected bands can't be demoted
+/// below their minimum.
+fn robin_hood_swaps(
+    candidates: &[Option<BandCandidates>; 32],
+    weights: &[f32; 32],
+    hf_floor: &[u8; 32],
+    num_active: usize,
+    tbl_choice: &mut [u8; 32],
+    sf_choice: &mut [usize; 32],
+    used_bits: &mut usize,
+    target: usize,
+) {
+    // Bit over-budget guard: if we already exceeded target, skip
+    // (tighten_to_budget will handle it).
+    for _pass in 0..8 {
+        let surplus_budget = target as i32 - *used_bits as i32;
+
+        // Find best promote candidate: band whose next tbl up has the
+        // highest weighted-mse reduction per extra bit.
+        let mut best_promote: Option<(usize, usize, i32, f32)> = None;
+        for b in 0..num_active {
+            let Some(bc) = candidates[b].as_ref() else { continue };
+            let cur_tbl = tbl_choice[b];
+            let cur_idx = sf_choice[b];
+            let cur_cand = if cur_tbl == 0 {
+                &bc.drop
+            } else {
+                &bc.real[cur_idx]
+            };
+            // Try every candidate above current tbl; pick best-gain.
+            for (i, cand) in bc.real.iter().enumerate() {
+                if cand.q.table_index <= cur_tbl {
+                    continue;
+                }
+                let dbits = cand.bits as i32 - cur_cand.bits as i32;
+                if dbits <= 0 {
+                    continue;
+                }
+                let dmse = cur_cand.mse - cand.mse;
+                if dmse <= 0.0 {
+                    continue;
+                }
+                let gain_per_bit = dmse * weights[b] / dbits as f32;
+                let is_better = match best_promote {
+                    None => true,
+                    Some((_, _, _, g)) => gain_per_bit > g,
+                };
+                if is_better {
+                    best_promote = Some((b, i, dbits, gain_per_bit));
+                }
+            }
+        }
+        let Some((p_band, p_idx, p_dbits, p_gain)) = best_promote else {
+            break;
+        };
+
+        // Need p_dbits extra bits. If we have surplus, just take them
+        // (no demote needed). Otherwise find the lowest-loss demote.
+        if p_dbits <= surplus_budget {
+            // free lunch — just promote
+            tbl_choice[p_band] = candidates[p_band].as_ref().unwrap().real[p_idx].q.table_index;
+            sf_choice[p_band] = p_idx;
+            *used_bits = (*used_bits as i32 + p_dbits) as usize;
+            continue;
+        }
+
+        let needed = (p_dbits - surplus_budget) as usize;
+        // Find demote with lowest weighted-mse rise per bit freed.
+        let mut best_demote: Option<(usize, Option<usize>, i32, f32)> = None;
+        for b in 0..num_active {
+            if b == p_band {
+                continue;
+            }
+            let Some(bc) = candidates[b].as_ref() else { continue };
+            let cur_tbl = tbl_choice[b];
+            if cur_tbl == 0 {
+                continue; // already at drop
+            }
+            let cur_idx = sf_choice[b];
+            let cur_cand = &bc.real[cur_idx];
+            let min_tbl = hf_floor[b];
+            // demote targets: drop candidate (tbl=0) if floor allows,
+            // or lower tbl in the real list down to floor.
+            if min_tbl == 0 {
+                let dbits = cur_cand.bits as i32 - bc.drop.bits as i32;
+                if dbits >= needed as i32 {
+                    let dmse = bc.drop.mse - cur_cand.mse;
+                    let loss_per_bit = dmse.max(0.0) * weights[b] / dbits as f32;
+                    let is_better = match best_demote {
+                        None => true,
+                        Some((_, _, _, l)) => loss_per_bit < l,
+                    };
+                    if is_better {
+                        best_demote = Some((b, None, dbits, loss_per_bit));
+                    }
+                }
+            }
+            for (i, cand) in bc.real.iter().enumerate() {
+                if cand.q.table_index >= cur_tbl || cand.q.table_index < min_tbl {
+                    continue;
+                }
+                let dbits = cur_cand.bits as i32 - cand.bits as i32;
+                if dbits < needed as i32 {
+                    continue;
+                }
+                let dmse = cand.mse - cur_cand.mse;
+                let loss_per_bit = dmse.max(0.0) * weights[b] / dbits as f32;
+                let is_better = match best_demote {
+                    None => true,
+                    Some((_, _, _, l)) => loss_per_bit < l,
+                };
+                if is_better {
+                    best_demote = Some((b, Some(i), dbits, loss_per_bit));
+                }
+            }
+        }
+        let Some((d_band, d_idx, d_dbits, d_loss)) = best_demote else {
+            break;
+        };
+
+        // Net improvement check. Promote gain on p_band, demote loss
+        // on d_band — want gain > loss per-bit to win.
+        if p_gain <= d_loss * 1.001 {
+            break; // not worth swapping
+        }
+
+        // Apply both moves.
+        tbl_choice[p_band] = candidates[p_band].as_ref().unwrap().real[p_idx].q.table_index;
+        sf_choice[p_band] = p_idx;
+        match d_idx {
+            Some(i) => {
+                tbl_choice[d_band] =
+                    candidates[d_band].as_ref().unwrap().real[i].q.table_index;
+                sf_choice[d_band] = i;
+            }
+            None => {
+                tbl_choice[d_band] = 0;
+                sf_choice[d_band] = 0;
+            }
+        }
+        *used_bits = (*used_bits as i32 + p_dbits - d_dbits) as usize;
+    }
+}
+
 
 fn tighten_to_budget(
     candidates: &[Option<BandCandidates>; 32],
