@@ -1170,6 +1170,118 @@ fn build_spectral_unit_budgeted(
         if upgrades_this_pass == 0 { break; }
     }
 
+    // RDO-Polisher "Robin Hood": Stiehl Bits von überversorgten Bändern,
+    // gib sie den bedürftigsten. Psycho v2 hat die warme Grundstruktur
+    // gesetzt — dieser Pass verfeinert nur die Ränder ohne den Charakter
+    // zu ändern.
+    //
+    // Pro Iteration: finde das Band das am MEISTEN von tbl+1 profitiert
+    // (höchstes delta_mse/delta_bits) und das Band das am WENIGSTEN
+    // von seinem aktuellen tbl profitiert (niedrigstes mse_gain/bits).
+    // Wenn der Swap netto-MSE verbessert → durchführen.
+    for _robin_pass in 0..8 {
+        // Finde bestes Promote-Target (bedürftigstes Band)
+        let mut best_promote: Option<(usize, QuantizedSubband, f32)> = None; // (band, candidate, mse_gain_per_bit)
+        let mut best_promote_extra = 0usize;
+        for band in 0..quantized_subbands.len().min(num_active_bands) {
+            let cur_tbl = quantized_subbands[band].table_index;
+            if cur_tbl == 0 || cur_tbl >= 7 { continue; }
+            let start = ATRAC3_SUBBAND_TAB[band];
+            let end = ATRAC3_SUBBAND_TAB[band + 1];
+            let slice = &coefficients[start..end];
+            let new_tbl = cur_tbl + 1;
+            let peak = slice.iter().map(|c| c.abs()).fold(0.0f32, f32::max);
+            let sf_center = optimal_sf_index_for_peak(peak, new_tbl);
+            for delta in -1i8..=2 {
+                let sf_try = (sf_center as i8 + delta).clamp(0, 63) as u8;
+                if let Ok(cand) = quantize_subband(slice, new_tbl, sf_try, coding_mode) {
+                    let extra = candidate_total_bits(&cand)
+                        .saturating_sub(candidate_total_bits(&quantized_subbands[band]));
+                    if extra == 0 { continue; }
+                    let mse_gain = quantized_subbands[band].mse - cand.mse;
+                    if mse_gain <= 0.0 { continue; }
+                    let eff = mse_gain / extra as f32;
+                    let is_better = match &best_promote {
+                        None => true,
+                        Some((_, _, prev_eff)) => eff > *prev_eff,
+                    };
+                    if is_better {
+                        best_promote = Some((band, cand, eff));
+                        best_promote_extra = extra;
+                    }
+                }
+            }
+        }
+
+        // Finde bestes Demote-Source (überversorgtes Band)
+        let mut best_demote: Option<(usize, QuantizedSubband, f32)> = None; // (band, candidate, mse_loss_per_bit)
+        let mut best_demote_savings = 0usize;
+        for band in 0..quantized_subbands.len().min(num_active_bands) {
+            let cur_tbl = quantized_subbands[band].table_index;
+            if cur_tbl <= 1 { continue; }
+            // Nicht vom Promote-Target stehlen
+            if best_promote.as_ref().map_or(false, |(b, _, _)| *b == band) { continue; }
+            let start = ATRAC3_SUBBAND_TAB[band];
+            let end = ATRAC3_SUBBAND_TAB[band + 1];
+            let slice = &coefficients[start..end];
+            let new_tbl = cur_tbl - 1;
+            let peak = slice.iter().map(|c| c.abs()).fold(0.0f32, f32::max);
+            let sf_center = optimal_sf_index_for_peak(peak, new_tbl);
+            for delta in -1i8..=2 {
+                let sf_try = (sf_center as i8 + delta).clamp(0, 63) as u8;
+                if let Ok(cand) = quantize_subband(slice, new_tbl, sf_try, coding_mode) {
+                    let savings = candidate_total_bits(&quantized_subbands[band])
+                        .saturating_sub(candidate_total_bits(&cand));
+                    if savings == 0 { continue; }
+                    let mse_loss = cand.mse - quantized_subbands[band].mse;
+                    let eff = mse_loss / savings as f32;
+                    let is_better = match &best_demote {
+                        None => true,
+                        Some((_, _, prev_eff)) => eff < *prev_eff, // lowest loss per bit
+                    };
+                    if is_better {
+                        best_demote = Some((band, cand, eff));
+                        best_demote_savings = savings;
+                    }
+                }
+            }
+        }
+
+        // Check ob Swap netto-MSE verbessert UND bits-neutral
+        match (&best_promote, &best_demote) {
+            (Some((p_band, p_cand, _)), Some((d_band, d_cand, _)))
+                if best_demote_savings >= best_promote_extra =>
+            {
+                let mse_gain = quantized_subbands[*p_band].mse - p_cand.mse;
+                let mse_loss = d_cand.mse - quantized_subbands[*d_band].mse;
+                if mse_gain > mse_loss * 1.1 {
+                    // Swap!
+                    let p_start = ATRAC3_SUBBAND_TAB[*p_band];
+                    let p_end = ATRAC3_SUBBAND_TAB[*p_band + 1];
+                    let d_start = ATRAC3_SUBBAND_TAB[*d_band];
+                    let d_end = ATRAC3_SUBBAND_TAB[*d_band + 1];
+                    if let Ok(p_recon) = p_cand.dequantized(p_end - p_start) {
+                        if let Ok(d_recon) = d_cand.dequantized(d_end - d_start) {
+                            reconstructed[p_start..p_end].copy_from_slice(&p_recon);
+                            reconstructed[d_start..d_end].copy_from_slice(&d_recon);
+                            payload_bits = payload_bits
+                                + p_cand.payload_bits + d_cand.payload_bits
+                                - quantized_subbands[*p_band].payload_bits
+                                - quantized_subbands[*d_band].payload_bits;
+                            spectral_subbands[*p_band] = p_cand.spectral_subband(coding_mode)?;
+                            spectral_subbands[*d_band] = d_cand.spectral_subband(coding_mode)?;
+                            quantized_subbands[*p_band] = p_cand.clone();
+                            quantized_subbands[*d_band] = d_cand.clone();
+                            continue; // next pass
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        break; // no viable swap found
+    }
+
     // Trim trailing uncoded
     while spectral_subbands.len() > 1
         && spectral_subbands.last().is_some_and(|s| s.table_index == 0)
