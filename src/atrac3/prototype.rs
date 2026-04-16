@@ -301,6 +301,23 @@ impl PrototypeEncoder {
         // ===== ECHTER 2-PASS ENCODING =====
         use rayon::prelude::*;
         let base_target = options.target_bits_per_channel.unwrap_or(1536);
+
+        // Globale Source-Quality-Detection: 128kbit MP3 → Psycho v2 Pass-2
+        // (warm, ignoriert MP3-Noise). Saubere Source → RDO Pass-2 (Budget füllen).
+        // HateMe: global -62 dB über 16kHz → MP3. Classic: -41 dB → clean.
+        let is_clean_source_global = {
+            let hf_total: f64 = all_analyses.iter().map(|frame| {
+                frame.iter().map(|ch|
+                    ch.coefficients[768..].iter().map(|&c| (c as f64)*(c as f64)).sum::<f64>()
+                ).sum::<f64>()
+            }).sum();
+            let all_total: f64 = all_analyses.iter().map(|frame| {
+                frame.iter().map(|ch|
+                    ch.coefficients.iter().map(|&c| (c as f64)*(c as f64)).sum::<f64>()
+                ).sum::<f64>()
+            }).sum();
+            hf_total / (all_total + 1e-20) > 0.00001 // -50 dB: HateMe (5.7e-7)=MP3, Classic (7.8e-5)=clean
+        };
         let search_opts = SearchOptions {
             lambda: options.lambda,
             target_bits: options.target_bits_per_channel,
@@ -414,12 +431,9 @@ impl PrototypeEncoder {
                         }
                     }
 
-                    // Pass 2: Psycho v2 + RDO-Nachschlag.
-                    // ERST Psycho v2 (warmer Sound), DANN RDO NUR für surplus-Bits.
-                    // Das behält die warme Grundstruktur und füllt nur die Lücken.
                     let mut pass2_search = search_opts;
                     pass2_search.target_bits = Some(base_target + max_surplus / 2);
-                    pass2_search.use_rdo = false; // Psycho v2 bleibt Basis!
+                    pass2_search.use_rdo = is_clean_source_global;
 
                     match encoder.encode_analyzed_frame(&pass2_analyses, options.coding_mode, pass2_search) {
                         Ok(f) if f.channels.iter().all(|ch| ch.bytes.len() <= 192) => Ok(f),
