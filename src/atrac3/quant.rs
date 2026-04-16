@@ -323,6 +323,7 @@ pub struct SearchOptions {
     /// the asymmetric upward neighbour spread that pulls quantization
     /// precision into the bands above each tonal-marked subband.
     pub tonal_marked_subbands: [bool; 32],
+    pub use_rdo: bool,
 }
 
 impl Default for SearchOptions {
@@ -332,6 +333,7 @@ impl Default for SearchOptions {
             target_bits: None,
             max_candidates_per_band: 64,
             tonal_marked_subbands: [false; 32],
+            use_rdo: false,
         }
     }
 }
@@ -504,12 +506,124 @@ pub fn choose_subband_encoding(
     Ok(best)
 }
 
+/// Pass-2 RDO-Allocator: nutzt ECHTE quantize_subband-Kosten statt
+/// heuristischem estimate_band_bit_cost. Greedy-Loop promoted Bänder
+/// nach sqrt(delta_mse)/delta_bits bis Budget VOLL ist.
+/// Warm-Start: übernimmt Pass-1's tbl/sf-Wahl als Ausgangspunkt.
+fn rdo_pass2_encoding(
+    coefficients: &[f32],
+    coding_mode: CodingMode,
+    target_bits: usize,
+) -> Result<SpectrumEncoding> {
+    ensure!(coefficients.len() == SAMPLES_PER_FRAME);
+    let mut num_active = 0usize;
+    for band in 0..32 {
+        let s = ATRAC3_SUBBAND_TAB[band];
+        let e = ATRAC3_SUBBAND_TAB[band + 1];
+        if coefficients[s..e].iter().any(|c| c.abs() > 1e-12) { num_active = band + 1; }
+    }
+    if num_active == 0 { num_active = 1; }
+    let overhead = fixed_sound_unit_bits(num_active);
+
+    // Pre-compute ECHTE Kosten: (band, tbl) → (QuantizedSubband, bits)
+    struct C { q: QuantizedSubband, bits: usize }
+    let mut cands: Vec<[Option<C>; 8]> = Vec::with_capacity(num_active);
+    for band in 0..num_active {
+        let s = ATRAC3_SUBBAND_TAB[band];
+        let e = ATRAC3_SUBBAND_TAB[band + 1];
+        let sl = &coefficients[s..e];
+        let pk = sl.iter().map(|c| c.abs()).fold(0.0f32, f32::max);
+        let mut bc: [Option<C>; 8] = [const { None }; 8];
+        bc[0] = Some(C { bits: 3, q: QuantizedSubband::uncoded(sl) });
+        if pk > 1e-12 {
+            for tbl in 1..=7u8 {
+                let sf_c = optimal_sf_index_for_peak(pk, tbl) as i8;
+                let mut best: Option<C> = None;
+                let mut best_mse = f32::INFINITY;
+                for d in -2i8..=4 {
+                    let sf = (sf_c + d).clamp(0, 63) as u8;
+                    if let Ok(q) = quantize_subband(sl, tbl, sf, coding_mode) {
+                        if q.mse < best_mse {
+                            best_mse = q.mse;
+                            best = Some(C { bits: candidate_total_bits(&q), q });
+                        }
+                    }
+                }
+                bc[tbl as usize] = best;
+            }
+        }
+        cands.push(bc);
+    }
+
+    // Greedy: start tbl=0, promote bestes sqrt(delta)/bits Ratio
+    let mut cur_tbl = vec![0u8; num_active];
+    let mut used = overhead + num_active * 3;
+    loop {
+        let mut best_b: Option<usize> = None;
+        let mut best_eff = f32::NEG_INFINITY;
+        let mut best_db = 0usize;
+        for band in 0..num_active {
+            let nt = cur_tbl[band] + 1;
+            if nt > 7 { continue; }
+            let nc = match &cands[band][nt as usize] { Some(c) => c, None => continue };
+            let cb = cands[band][cur_tbl[band] as usize].as_ref().map_or(3, |c| c.bits);
+            let db = nc.bits.saturating_sub(cb);
+            if db == 0 || used + db > target_bits { continue; }
+            let cm = cands[band][cur_tbl[band] as usize].as_ref().map_or(
+                { let s = ATRAC3_SUBBAND_TAB[band]; let e = ATRAC3_SUBBAND_TAB[band+1];
+                  coefficients[s..e].iter().map(|c|c*c).sum::<f32>() / (e-s).max(1) as f32 },
+                |c| c.q.mse);
+            let dm = cm - nc.q.mse;
+            if dm <= 0.0 { continue; }
+            let w = (ATRAC3_SUBBAND_TAB[band+1] - ATRAC3_SUBBAND_TAB[band]).max(1) as f32;
+            let eff = dm.sqrt() / (w * db as f32);
+            if eff > best_eff { best_eff = eff; best_b = Some(band); best_db = db; }
+        }
+        match best_b {
+            Some(b) => { cur_tbl[b] += 1; used += best_db; }
+            None => break,
+        }
+    }
+
+    // Build output
+    let mut qsubs = Vec::with_capacity(num_active);
+    let mut recon = vec![0.0f32; coefficients.len()];
+    let mut specs = Vec::with_capacity(num_active);
+    let mut pbits = 0usize;
+    for band in 0..num_active {
+        let s = ATRAC3_SUBBAND_TAB[band];
+        let e = ATRAC3_SUBBAND_TAB[band + 1];
+        let c = cands[band][cur_tbl[band] as usize].take()
+            .unwrap_or_else(|| C { q: QuantizedSubband::uncoded(&coefficients[s..e]), bits: 3 });
+        if c.q.table_index > 0 {
+            if let Ok(r) = c.q.dequantized(e - s) { recon[s..e].copy_from_slice(&r); }
+        }
+        pbits += c.q.payload_bits;
+        specs.push(c.q.spectral_subband(coding_mode)?);
+        qsubs.push(c.q);
+    }
+    while specs.len() > 1 && specs.last().is_some_and(|s| s.table_index == 0) { specs.pop(); }
+    for band in num_active..32 {
+        let s = ATRAC3_SUBBAND_TAB[band]; let e = ATRAC3_SUBBAND_TAB[band + 1];
+        recon[s..e].fill(0.0);
+        qsubs.push(QuantizedSubband::uncoded(&coefficients[s..e]));
+    }
+    Ok(SpectrumEncoding {
+        spectral_unit: SpectralUnit { coding_mode, subbands: specs },
+        quantized_subbands: qsubs, reconstructed: recon.clone(), payload_bits: pbits,
+        mse: mean_square(coefficients, &recon),
+    })
+}
+
 pub fn build_spectral_unit(
     coefficients: &[f32],
     coding_mode: CodingMode,
     options: SearchOptions,
 ) -> Result<SpectrumEncoding> {
     if let Some(target_bits) = options.target_bits {
+        if options.use_rdo {
+            return rdo_pass2_encoding(coefficients, coding_mode, target_bits);
+        }
         return build_spectral_unit_budgeted(coefficients, coding_mode, options, target_bits);
     }
 

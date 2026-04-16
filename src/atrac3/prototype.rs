@@ -306,6 +306,7 @@ impl PrototypeEncoder {
             target_bits: options.target_bits_per_channel,
             max_candidates_per_band: 64,
             tonal_marked_subbands: [false; 32],
+            use_rdo: false, // Pass 1 = Psycho v2 (warm)
         };
 
         // PASS 1: Encode mit Standard-Budget → sammle echte Metriken
@@ -414,7 +415,8 @@ impl PrototypeEncoder {
                     }
 
                     let mut pass2_search = search_opts;
-                    pass2_search.target_bits = Some(base_target + max_surplus / 3);
+                    pass2_search.target_bits = Some(base_target + max_surplus / 2);
+                    pass2_search.use_rdo = true; // RDO-Allocator mit echten Kosten
 
                     match encoder.encode_analyzed_frame(&pass2_analyses, options.coding_mode, pass2_search) {
                         Ok(f) if f.channels.iter().all(|ch| ch.bytes.len() <= 192) => Ok(f),
