@@ -445,33 +445,43 @@ impl PrototypeEncoder {
                 }
             }
 
-            // Per-Coef HF Noise-Gate (Vorbis-inspiriert):
-            // Für Bänder 20+ (Upper-Mid/Presence/Brilliance): eliminiere
-            // einzelne Coefs die < X% des Band-Peaks sind. Behalte starke
-            // Peaks (echtes Signal = Harmonics/Transienten), entferne
-            // schwache (= Quant-Noise-Kandidaten).
+            // Spectral-Floor-Subtraction (klassisches Denoising):
             //
-            // Effekt: weniger ±1 Mantissas → weniger Noise-Power,
-            // kürzere VLC → SPART Bits → Budget für andere Bänder,
-            // HF-Korrelation steigt (nur echte Peaks übrig).
-            for band in 20..32 {
+            // Pro HF-Band: schätze den Noise-Floor als Median der |Coefs|.
+            // Subtrahiere den Floor von jedem Coef (Soft-Threshold).
+            // Coefs unter dem Floor → 0. Coefs über dem Floor → Signal.
+            //
+            // Mathematisch: cleaned = sign(c) × max(0, |c| - floor × α)
+            //
+            // Das ist was Opus/Vorbis intern machen: "noise shaping" durch
+            // Entfernung des flachen Noise-Bodens. Ergebnis: nur die echten
+            // Peaks (Harmonics, Transienten) bleiben → weniger Mantissa=±1
+            // Noise, höhere Korrelation, natürlicherer Sound.
+            for band in 16..32 {
                 let s = ATRAC3_SUBBAND_TAB[band];
                 let e = ATRAC3_SUBBAND_TAB[band + 1];
                 if e > residual.len() { break; }
-                let band_peak = residual[s..e].iter()
-                    .map(|c| c.abs()).fold(0.0f32, f32::max);
-                if band_peak < 1e-12 { continue; }
-                // Threshold: adaptiv nach Band-Position
-                // Upper-Mid (20-25): sanft 3% — enthält Stimmen-Obertöne
-                // Presence (26-29): mittel 8% — Zischlaute/Cymbal-Tails
-                // Brilliance (30-31): aggressiv 15% — meist Noise
-                let pct = if band >= 30 { 0.15 }
-                    else if band >= 26 { 0.08 }
-                    else { 0.03 };
-                let threshold = band_peak * pct;
+                let width = e - s;
+                if width < 4 { continue; }
+                // Schätze Noise-Floor via sortierte Magnitude (Percentile-25)
+                let mut mags: Vec<f32> = residual[s..e].iter()
+                    .map(|c| c.abs()).collect();
+                mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let floor_idx = width / 4; // 25th percentile
+                let noise_floor = mags[floor_idx];
+                if noise_floor < 1e-12 { continue; }
+                // Stärke adaptiv: HF aggressiver als Mid
+                let alpha = if band >= 28 { 1.5f32 }   // Brilliance: 150% Floor
+                    else if band >= 22 { 0.7 }           // Presence: 70% (Stimmen schonen)
+                    else { 0.4 };                         // Upper-Mid: 40% (minimal)
+                let threshold = noise_floor * alpha;
+                // Soft-Threshold Subtraction
                 for coef in residual[s..e].iter_mut() {
-                    if coef.abs() < threshold {
+                    let mag = coef.abs();
+                    if mag <= threshold {
                         *coef = 0.0;
+                    } else {
+                        *coef = coef.signum() * (mag - threshold);
                     }
                 }
             }
