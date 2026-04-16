@@ -3,6 +3,26 @@ use std::sync::OnceLock;
 
 use anyhow::{Result, anyhow, ensure};
 
+/// Minimum table index for Presence and Brilliance bands that carry
+/// non-trivial signal energy. At tbl=1 the quantisation grid allows
+/// only mantissa levels {-1, 0, +1}; for HF slices where the bulk of
+/// coefficients sit below half the peak this collapses most of them to
+/// zero and wipes the band's amplitude envelope. tbl=2 (five levels)
+/// keeps enough non-zero mantissas alive to track the envelope, which
+/// is what the ear actually follows at these frequencies.
+///
+/// Restricted to band >= 24 because extending the floor to Upper-Mid
+/// (20-23) steals too many bits from the Mid range and collapses Mid
+/// SNR. Restricted to peak_sf >= 4 (≈ -22 dB or louder) so that truly
+/// empty HF bands still cost nothing.
+fn min_tbl_for_band(band: usize, band_peak_sf: i32) -> u8 {
+    if band >= 24 && band_peak_sf >= 4 {
+        2
+    } else {
+        1
+    }
+}
+
 use super::{
     SAMPLES_PER_FRAME,
     sound_unit::{
@@ -943,11 +963,11 @@ fn build_spectral_unit_budgeted(
     );
     ensure!(target_bits > 0, "target_bits must be positive");
 
-    // --- Phase 1: Compute per-band energy statistics ---
+    // --- Phase 1a: Measure per-band peak/energy ---
     let mut group_sf: Vec<Vec<u8>> = Vec::with_capacity(32);
     let mut band_peak_sf = [0i32; 32];
     let mut band_energy_sum = [0i32; 32];
-    let mut num_active_bands = 0usize;
+    let mut frame_peak_sf: i32 = 0;
 
     for band in 0..32 {
         let start = ATRAC3_SUBBAND_TAB[band];
@@ -961,19 +981,37 @@ fn build_spectral_unit_budgeted(
             peak = peak.max(s);
             energy += s;
         }
-
-        // Kill quiet bands (Sony energy threshold check)
-        if energy < ENERGY_THRESHOLD[band] && peak < 3 {
-            peak = 0;
-            energy = 0;
-        }
-
         band_peak_sf[band] = peak;
         band_energy_sum[band] = energy;
-        if peak > 0 {
+        frame_peak_sf = frame_peak_sf.max(peak);
+        group_sf.push(groups);
+    }
+
+    // --- Phase 1b: Frame-adaptive silence scalar (Sony trick #7) ---
+    // peak_sf is logarithmic (each step = 2^(1/3) ≈ +4.5 dB in amplitude).
+    // In quiet frames, raise the kill threshold so more bands fall to
+    // tbl=0. Bits saved flow to the few still-active bands; the result is
+    // deeper silence in fade-outs / breathing pauses and cleaner handling
+    // of encoder noise coming from lossy source material.
+    let silence_scalar = if frame_peak_sf < 8 {
+        4
+    } else if frame_peak_sf < 16 {
+        2
+    } else {
+        1
+    };
+
+    // --- Phase 1c: Kill quiet bands with frame-adaptive threshold ---
+    let mut num_active_bands = 0usize;
+    for band in 0..32 {
+        let threshold = ENERGY_THRESHOLD[band] * silence_scalar;
+        if band_energy_sum[band] < threshold && band_peak_sf[band] < 3 {
+            band_peak_sf[band] = 0;
+            band_energy_sum[band] = 0;
+        }
+        if band_peak_sf[band] > 0 {
             num_active_bands = band + 1;
         }
-        group_sf.push(groups);
     }
 
     if num_active_bands == 0 {
@@ -1074,7 +1112,8 @@ fn build_spectral_unit_budgeted(
     let mut total_cost: i32 = 0;
     for band in 0..num_active_bands {
         if band_peak_sf[band] == 0 { continue; }
-        let initial = ((effective_peak[band] + 4) / 8).clamp(1, 7);
+        let min_tbl = min_tbl_for_band(band, band_peak_sf[band]);
+        let initial = ((effective_peak[band] + 4) / 8).clamp(min_tbl as i32, 7);
         tbl_indices[band] = initial as u8;
         total_cost += cost_at[band][initial as usize];
     }
@@ -1091,7 +1130,8 @@ fn build_spectral_unit_budgeted(
 
         for band in 0..num_active_bands {
             let current_tbl = tbl_indices[band];
-            if current_tbl <= 1 { continue; }
+            let min_tbl = min_tbl_for_band(band, band_peak_sf[band]);
+            if current_tbl <= min_tbl { continue; }
             let next_tbl = current_tbl - 1;
             let savings = cost_at[band][current_tbl as usize] - cost_at[band][next_tbl as usize];
             if savings <= 0 { continue; }
@@ -1179,19 +1219,13 @@ fn build_spectral_unit_budgeted(
         let peak = slice.iter().map(|c| c.abs()).fold(0.0f32, f32::max);
         let sf_center = optimal_sf_index_for_peak(peak, selector);
 
-        // sfIndex refinement: given the peak-fitting sfIndex (computed with
-        // ceil, so it always accommodates the peak), search up to three
-        // steps above it and pick the one that minimizes the worst-case
-        // absolute reconstruction error. Going below sf_center would clip
-        // the peak; going above trades precision for coarser grid which the
-        // criterion will prefer only when the finer grid actually produces
-        // a worse worst-case bin.
-        // v3g sfIndex-Bump: HF-Bänder bekommen höheren Start-Delta und MSE-
-        // Kriterium statt max_abs_err. Gröbere Steps → mehr Mantissa=0 → weniger
-        // Noise-Power → natürlicherer HF-Sound (Sony's 64% statt 121%).
-        // sfIndex-Bump für HF: sweet-spot zwischen weniger Noise (SNR↑) und
-        // erhaltener Korrelation (HF-Corr stabil). Zu aggressiv zerstört
-        // Waveform, zu konservativ lässt Noise durch.
+        // sfIndex refinement: given the peak-fitting sfIndex (computed
+        // with ceil, so it always accommodates the peak), search a few
+        // steps above it and pick the one that minimises the band's
+        // reconstruction error under the metric appropriate for its
+        // frequency range. HF bands use a higher start_delta (coarser
+        // grid → more mantissa=0 → lower noise power, closer to Sony's
+        // HF character). Going below sf_center would clip the peak.
         let (start_delta, max_delta) = if band >= 28 {
             (2i8, 5i8)  // Brilliance
         } else if band >= 22 {
@@ -1201,6 +1235,8 @@ fn build_spectral_unit_budgeted(
         } else {
             (0i8, 3i8)
         };
+        // MSE in HF (matches the ear's spectral masking) vs. max_abs_err
+        // in LF (where peak fidelity dominates perception).
         let use_mse = band >= 20;
         let mut best: Option<QuantizedSubband> = None;
         let mut best_score = f32::INFINITY;
@@ -1209,7 +1245,11 @@ fn build_spectral_unit_budgeted(
             if let Ok(candidate) = quantize_subband(slice, selector, sf_try, coding_mode) {
                 let bits = candidate_total_bits(&candidate);
                 if used_bits + bits <= target_bits {
-                    let score = if use_mse { candidate.mse } else { candidate.max_abs_err };
+                    let score = if use_mse {
+                        candidate.mse
+                    } else {
+                        candidate.max_abs_err
+                    };
                     if best.is_none() || score < best_score - 1e-12 {
                         best_score = score;
                         best = Some(candidate);
@@ -1241,6 +1281,8 @@ fn build_spectral_unit_budgeted(
         quantized_subbands.push(quantized);
     }
 
+    let mut surplus = target_bits.saturating_sub(used_bits);
+
     // POST-PROMOTION: use real bit costs to fill remaining slot capacity.
     // Runs in multiple passes. Each pass walks the subbands in importance
     // order and tries to upgrade the table index by one, if the real bit
@@ -1248,7 +1290,6 @@ fn build_spectral_unit_budgeted(
     // can free additional bits that become available to later passes, so
     // we iterate until no upgrade is found or surplus drops below a small
     // floor.
-    let mut surplus = target_bits.saturating_sub(used_bits);
     for _pass in 0..12 {
         if surplus < 10 { break; }
         // Auch tbl=0 Bänder für Promotion betrachten — dort liegen
