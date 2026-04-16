@@ -129,11 +129,11 @@ pub fn allocate(
         //    band even when the rest of the spectrum matches.
         if low_pass_source {
             if b >= 30 {
-                w *= 0.05;
-            } else if b >= 28 {
                 w *= 0.3;
+            } else if b >= 28 {
+                w *= 0.5;
             } else if b >= 22 {
-                w *= 0.8;
+                w *= 1.0;  // iter2: was 0.8 — Brilliance stays full weight
             } else if b >= 16 {
                 w *= 1.3;
             }
@@ -152,35 +152,27 @@ pub fn allocate(
         if headroom <= 6.0 {
             continue;
         }
-        // Layered floors, tuned from vocal-clarity measurements:
+        // Iter2: floors on every source class. Lossy upstream doesn't
+        // mean "the HF doesn't exist" — it means HF content is flat
+        // and quiet. Even a tbl=1 encode preserves the envelope and
+        // saves the octave-balance penalty we were taking for dropping
+        // the band to silence.
         //
-        //   Band 16-21 (≈ 4.1-8.3 kHz): VOCAL-CLARITY FLOOR.
-        //     Always floor to tbl ≥ 1. Sibilance and vocal presence
-        //     live here. Without this, voices measure 0.7 dB below
-        //     reference in the 4-6 kHz band and are perceived as
-        //     "dumpfer" than classic's output (verified with
-        //     tools/waveform_dive.py on a 128 kbps MP3 re-encode).
-        //
-        //   Band 22-27 (≈ 8.3-13.8 kHz): clean-source only, tbl ≥ 1.
-        //     Low-pass sources leave this band to the RDO / weight
-        //     dampener — it's usually upstream quantiser noise there.
-        //
-        //   Band 28+ (≈ 13.8+ kHz): Brilliance floor tbl ≥ 2 on
-        //     clean sources; disabled on low-pass sources where the
-        //     band carries no real information.
-        if b >= 28 {
-            if !low_pass_source && headroom > 12.0 {
-                hf_floor[b] = 2;
-            }
-        } else if b >= 22 {
-            if !low_pass_source && headroom > 12.0 {
+        //   Band 16-21 (≈ 4.1-8.3 kHz): vocal-clarity floor tbl=2
+        //   Band 22-27 (≈ 8.3-13.8 kHz): brilliance floor tbl=1
+        //   Band 28-29 (≈ 13.8-15.1 kHz): upper brilliance, tbl=1
+        //   Band 30-31 (≈ 16.5+ kHz): air, tbl=1 with stricter
+        //                              headroom so we don't spend
+        //                              bits on pure noise.
+        if b >= 30 {
+            if headroom > 10.0 {
                 hf_floor[b] = 1;
             }
+        } else if b >= 28 {
+            hf_floor[b] = if !low_pass_source && headroom > 12.0 { 2 } else { 1 };
+        } else if b >= 22 {
+            hf_floor[b] = 1;
         } else if b >= 16 {
-            // Vocal-clarity floor. tbl=2 (5 mantissa levels) rather
-            // than tbl=1 (3 levels) — sibilance and breath need the
-            // extra resolution to avoid "kantig" reconstruction.
-            // Costs ~5-8 bits per band, budget allows it.
             hf_floor[b] = 2;
         }
     }
