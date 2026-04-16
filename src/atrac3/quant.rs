@@ -344,6 +344,13 @@ pub struct SearchOptions {
     /// precision into the bands above each tonal-marked subband.
     pub tonal_marked_subbands: [bool; 32],
     pub use_rdo: bool,
+    /// 0 for the left channel, 1 for the right. ATRAC3 stereo has
+    /// two independent Sound Units per frame, processed sequentially,
+    /// so per-channel psycho state (e.g. prev-frame QMF energies for
+    /// transient detection, prev-frame magnitudes for prediction-
+    /// based tonality) must key on this index rather than a shared
+    /// thread_local slot. Default 0 for mono / single-channel paths.
+    pub channel_idx: usize,
 }
 
 impl Default for SearchOptions {
@@ -354,6 +361,7 @@ impl Default for SearchOptions {
             max_candidates_per_band: 64,
             tonal_marked_subbands: [false; 32],
             use_rdo: false,
+            channel_idx: 0,
         }
     }
 }

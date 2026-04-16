@@ -17,11 +17,26 @@ use std::cell::RefCell;
 use crate::atrac3::{SAMPLES_PER_FRAME, quant::ATRAC3_SUBBAND_TAB};
 
 thread_local! {
-    /// Per-QMF-subband RMS energy of the previous frame, used for the
-    /// frame-to-frame jump transient detector. Shared across L/R — that
-    /// blurs stereo transients slightly but costs one buffer instead of
-    /// two and is good enough for gain steering.
-    static PREV_QMF_ENERGY: RefCell<[f32; 4]> = const { RefCell::new([0.0; 4]) };
+    /// Per-channel state. ATRAC3 encodes L and R into separate Sound
+    /// Units per frame, called sequentially; a single thread_local slot
+    /// would overwrite L's state when R is processed and vice versa.
+    /// Indexed by channel (0 = L, 1 = R).
+    static PREV_QMF_ENERGY: RefCell<[[f32; 4]; 2]> =
+        const { RefCell::new([[0.0; 4]; 2]) };
+    static PREV_TRANSIENT: RefCell<[[bool; 4]; 2]> =
+        const { RefCell::new([[false; 4]; 2]) };
+    static PREV_MAG: RefCell<[[f32; 32]; 2]> =
+        const { RefCell::new([[0.0; 32]; 2]) };
+    static PREV_PREV_MAG: RefCell<[[f32; 32]; 2]> =
+        const { RefCell::new([[0.0; 32]; 2]) };
+    /// Current-frame subband energies of the OTHER channel. Written by
+    /// channel 0 (L) at the start of its compute(), read by channel 1
+    /// (R) in the same frame. Enables interchannel masking: a loud L
+    /// band masks the same-frequency R band perceptually (binaural
+    /// summation across cochlear overlap), letting the encoder spend
+    /// fewer bits on R's copy of centered content.
+    static CROSS_CHAN_ENERGY: RefCell<[f32; 32]> =
+        const { RefCell::new([-120.0; 32]) };
 }
 
 /// Number of Bark critical bands we use (Zwicker 1980).
@@ -77,14 +92,26 @@ pub struct PsychoDrive {
 ///
 /// `sample_rate` matters only for the ATH and Bark mapping; ATRAC3 is
 /// effectively always 44.1 kHz but we keep it parameterised.
-pub fn compute(coefficients: &[f32], sample_rate: u32) -> PsychoDrive {
+///
+/// `channel_idx` (0 or 1) selects which per-channel history slot to
+/// use for the transient detector and prediction-based tonality. Mono
+/// paths can pass 0.
+pub fn compute(coefficients: &[f32], sample_rate: u32, channel_idx: usize) -> PsychoDrive {
     assert_eq!(coefficients.len(), SAMPLES_PER_FRAME);
+    let ch = channel_idx.min(1);
 
     let bark_e = bark_band_energies(coefficients, sample_rate);
     let bark_e_db = bark_e.map(to_db);
 
-    let tonality_per_subband = subband_tonality(coefficients);
+    // Stufe B (prediction tonality): regresses HateMe 1.02 → 1.38 even
+    // with per-channel state. Hypothesis: dynamic vocal material has
+    // fast-changing magnitudes the linear predictor can't track, so
+    // tonality collapses to zero on actual tonal content. Stays off.
+    // SFM is a gentler measure for real program material.
+    let _ = prediction_tonality; // keep the function for later use
     let subband_energy_db = subband_energy_db(coefficients);
+    let tonality_per_subband = subband_tonality(coefficients);
+    let _ = ch; // silence the warning when prediction_tonality is unused
 
     let ath_db = subband_ath_db(sample_rate);
 
@@ -109,7 +136,53 @@ pub fn compute(coefficients: &[f32], sample_rate: u32) -> PsychoDrive {
         pe += bits_here;
     }
 
-    let transient_per_qmf = detect_transients(coefficients);
+    let transient_per_qmf = detect_transients(coefficients, ch);
+    // Stufe A (temporal masking) stays disabled — see note below.
+
+    // Interchannel masking (stereo-aware pipeline).
+    //
+    // ATRAC3 at 132 kbps VLC has no format-level joint-stereo coupling:
+    // both channels are encoded as independent sound units. Mid/Side
+    // coding isn't available to us at the bitstream level. BUT the
+    // human auditory system does binaural masking across the two ears
+    // — when the same frequency is loud in L, the cochlear response
+    // partially masks the corresponding R content. A perceptually
+    // equivalent encode can therefore use coarser quantisation on the
+    // quieter side of a centered peak without an audible difference.
+    //
+    // Classic doesn't do this (its comment flatly says "both channels
+    // coded independently"). We do it here with a cheap one-direction
+    // hand-off: L writes its subband_energy_db to a shared slot when
+    // it runs, R reads the slot and raises its mask wherever the L
+    // band was significantly louder. Symmetric handling (R→L) would
+    // require a two-pass iteration or frame lookahead; the one-way
+    // version already covers centered content well enough for a
+    // first stereo-aware prototype.
+    let mut subband_mask_db = subband_mask_db;
+    if ch == 0 {
+        // Left channel: publish our energies for the right channel to
+        // consult in this same frame.
+        CROSS_CHAN_ENERGY.with(|c| *c.borrow_mut() = subband_energy_db);
+    } else {
+        // Right channel: boost the mask in bands where L was louder.
+        // Binaural masking threshold: ~2 dB per dB of L-over-R delta,
+        // capped at +6 dB so we never go fully deaf on one side.
+        let l_energy = CROSS_CHAN_ENERGY.with(|c| *c.borrow());
+        for b in 0..32 {
+            let delta = l_energy[b] - subband_energy_db[b];
+            // Binaural masking: ~0.5 dB R-mask boost per dB L-over-R
+            // delta, threshold +6 dB so only real centering triggers,
+            // cap +6 dB so we never deafen one side. Stronger params
+            // tested (3 dB threshold / 0.8× slope) produced identical
+            // mono scores — our ear_judge is stereo-blind (uses the
+            // downmix), so deliberate conservatism until the test
+            // suite gains a per-channel or mid/side metric.
+            if delta > 6.0 {
+                let boost = ((delta - 6.0) * 0.5).min(6.0);
+                subband_mask_db[b] += boost;
+            }
+        }
+    }
 
     // HF-quality flag: sum the MDCT coefficient energies of bins ≥ 768
     // (roughly 16 kHz+) and compare to total energy. A MP3 @ 128 kbps
@@ -146,7 +219,8 @@ pub fn compute(coefficients: &[f32], sample_rate: u32) -> PsychoDrive {
 /// buffer across channels. A 4× jump marks the subband as transient;
 /// that flag drives the RDO's HF weight boost and (later) the gain
 /// envelope's attack-point count.
-fn detect_transients(coefficients: &[f32]) -> [bool; 4] {
+fn detect_transients(coefficients: &[f32], channel_idx: usize) -> [bool; 4] {
+    let ch = channel_idx.min(1);
     let mut current = [0.0f32; 4];
     for q in 0..4 {
         let mut e = 1e-20_f32;
@@ -155,16 +229,14 @@ fn detect_transients(coefficients: &[f32]) -> [bool; 4] {
         }
         current[q] = e;
     }
-    let prev = PREV_QMF_ENERGY.with(|c| *c.borrow());
+    let prev = PREV_QMF_ENERGY.with(|c| c.borrow()[ch]);
     let mut out = [false; 4];
     for q in 0..4 {
-        // 4× energy jump + minimum absolute level to avoid firing on
-        // noise in otherwise silent frames.
         if current[q] > 4.0 * prev[q].max(1e-10) && current[q] > 1e-3 {
             out[q] = true;
         }
     }
-    PREV_QMF_ENERGY.with(|c| *c.borrow_mut() = current);
+    PREV_QMF_ENERGY.with(|c| c.borrow_mut()[ch] = current);
     out
 }
 
@@ -374,6 +446,76 @@ fn subband_energy_db(coefficients: &[f32]) -> [f32; 32] {
     out
 }
 
+/// Prediction-based tonality (MPEG-1/2 Psychoacoustic Model 2).
+///
+/// Compute per-subband the "unpredictability measure" by linearly
+/// extrapolating the magnitude from the two previous frames and
+/// comparing to the actual. Then map to a tonality coefficient in
+/// [0, 1] via the standard formula `tonality = -0.299 - 0.43·log10(u)`,
+/// clamped. Requires thread-local 2-frame history; first two frames
+/// fall back to an SFM-based estimate so the encoder warms up gracefully.
+fn prediction_tonality(coefficients: &[f32], channel_idx: usize) -> [f32; 32] {
+    let ch = channel_idx.min(1);
+    let prev: [f32; 32] = PREV_MAG.with(|c| c.borrow()[ch]);
+    let prev_prev: [f32; 32] = PREV_PREV_MAG.with(|c| c.borrow()[ch]);
+
+    let mut cur_mag = [0.0_f32; 32];
+    let mut out = [0.0_f32; 32];
+    let warmup = prev_prev.iter().all(|&v| v == 0.0);
+
+    for b in 0..32 {
+        let start = ATRAC3_SUBBAND_TAB[b];
+        let end = ATRAC3_SUBBAND_TAB[b + 1];
+        // Per-subband magnitude = sqrt(mean-energy). Simpler than the
+        // polar-coordinate dual-path of exact PM2 but captures the
+        // same prediction signal for our band-aggregated context.
+        let mut e = 0.0_f32;
+        for c in &coefficients[start..end] {
+            e += c * c;
+        }
+        let mag = (e / (end - start) as f32).sqrt().max(1e-20);
+        cur_mag[b] = mag;
+
+        if warmup {
+            // Warm-up: fall back to SFM-based tonality until two
+            // frames of history are built up. Same code path as the
+            // old `subband_tonality` but inlined for clarity.
+            let slice = &coefficients[start..end];
+            let mut log_sum = 0.0_f32;
+            let mut arith = 0.0_f32;
+            for c in slice {
+                let sq = c * c + 1e-20;
+                log_sum += sq.ln();
+                arith += sq;
+            }
+            let n = slice.len() as f32;
+            let sfm = (log_sum / n).exp() / (arith / n + 1e-20);
+            out[b] = (-sfm.max(1e-10).log10() / 2.0).clamp(0.0, 1.0);
+            continue;
+        }
+
+        // Linear prediction: if magnitude changes at a constant rate,
+        // predict = 2*prev − prev_prev. Pure sine: prediction is exact,
+        // unpredictability → 0. White noise: prediction is random,
+        // unpredictability → ~1.
+        let predicted = (2.0 * prev[b] - prev_prev[b]).max(0.0);
+        let denom = mag + predicted + 1e-20;
+        let unpred = ((mag - predicted).abs() / denom).clamp(1e-6, 1.0);
+        // MPEG formula: tonality = -0.299 - 0.43 * ln(u), clamped
+        // to [0, 1]. A typical pure sine gives u ≈ 0.01, yielding
+        // tonality ≈ 1.6 — we clamp at 1. White noise u ≈ 0.6 gives
+        // tonality ≈ -0.08 — we clamp at 0.
+        let t = -0.299 - 0.43 * unpred.ln();
+        out[b] = t.clamp(0.0, 1.0);
+    }
+
+    // Shift history (per channel).
+    PREV_PREV_MAG.with(|c| c.borrow_mut()[ch] = prev);
+    PREV_MAG.with(|c| c.borrow_mut()[ch] = cur_mag);
+    out
+}
+
+#[allow(dead_code)]
 fn subband_tonality(coefficients: &[f32]) -> [f32; 32] {
     let mut out = [0.0_f32; 32];
     for b in 0..32 {
@@ -437,7 +579,7 @@ mod tests {
     #[test]
     fn compute_finishes_on_silence() {
         let c = vec![0.0f32; SAMPLES_PER_FRAME];
-        let p = compute(&c, 44100);
+        let p = compute(&c, 44100, 0);
         assert!(p.pe_required_bits.is_finite());
         // silence → all subband energies at floor
         for e in &p.subband_energy_db {
@@ -448,7 +590,7 @@ mod tests {
     #[test]
     fn compute_on_1khz_sine_flags_bark_3() {
         let c = sine_frame(1000.0, 44100, 1.0);
-        let p = compute(&c, 44100);
+        let p = compute(&c, 44100, 0);
         // 1 kHz lives in Bark band 8 (920-1080 Hz).
         let loudest = p
             .bark_energy_db
@@ -463,7 +605,7 @@ mod tests {
     #[test]
     fn tonality_on_sine_is_high() {
         let c = sine_frame(2000.0, 44100, 1.0);
-        let p = compute(&c, 44100);
+        let p = compute(&c, 44100, 0);
         let max_t = p.tonality.iter().cloned().fold(0.0, f32::max);
         assert!(max_t > 0.5, "sine tonality should be > 0.5, got {}", max_t);
     }

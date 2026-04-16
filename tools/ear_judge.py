@@ -329,6 +329,11 @@ PEN_WEIGHTS = {
     'nmr_max_over':         (0.8, 'NMR over mask',         3.0),
     'onset_fidelity':       (4.0, 'Onset fidelity',        0.0),
     'loudness_delta':       (1.5, 'Loudness Δ',            0.3),
+    # Stereo-aware penalties (otherwise the mono downmix hides
+    # interchannel-masking regressions).
+    'side_snr_deficit_db':  (0.4, 'Side-signal SNR deficit (dB)', 0.0),
+    'width_shift_db':       (2.0, 'Stereo width shift',    0.3),
+    'lr_corr_shift':        (3.0, 'L-R correlation shift', 0.02),
 }
 
 
@@ -393,6 +398,47 @@ def judge(ref_path, enc_path, label=None):
     except Exception:
         loudness_delta = 0.0
 
+    # Stereo quality. A mono downmix blinds ear_judge to
+    # interchannel-masking artefacts (an encoder can quietly throw
+    # away one channel's detail without the mono SNR moving). Measure
+    # the side signal directly and the stereo-width / L-R-correlation
+    # drift — the user-reported audibility of a stereo change.
+    side_snr_db = 30.0
+    width_shift_db = 0.0
+    lr_corr_shift = 0.0
+    try:
+        _, ref_st = load_stereo(ref_path)
+        _, enc_st = load_stereo(enc_path)
+        n2 = min(len(ref_st), len(enc_st))
+        ref_st = ref_st[:n2]
+        enc_st = enc_st[:n2]
+        r_mid = (ref_st[:, 0] + ref_st[:, 1]) * 0.5
+        r_side = (ref_st[:, 0] - ref_st[:, 1]) * 0.5
+        t_mid = (enc_st[:, 0] + enc_st[:, 1]) * 0.5
+        t_side = (enc_st[:, 0] - enc_st[:, 1]) * 0.5
+        r_mid_e = float(np.mean(r_mid ** 2) + 1e-20)
+        r_side_e = float(np.mean(r_side ** 2) + 1e-20)
+        t_mid_e = float(np.mean(t_mid ** 2) + 1e-20)
+        t_side_e = float(np.mean(t_side ** 2) + 1e-20)
+        side_err_e = float(np.mean((r_side - t_side) ** 2) + 1e-20)
+        # Side SNR: how faithfully is the side signal preserved.
+        # Low = stereo detail damaged.
+        side_snr_db = 10.0 * np.log10(r_side_e / side_err_e)
+        r_width = 10.0 * np.log10(r_side_e / r_mid_e)
+        t_width = 10.0 * np.log10(t_side_e / t_mid_e)
+        width_shift_db = abs(t_width - r_width)
+        def _corr(a, b):
+            if np.std(a) < 1e-6 or np.std(b) < 1e-6:
+                return 1.0
+            return float(np.corrcoef(a, b)[0, 1])
+        lr_corr_shift = abs(_corr(enc_st[:, 0], enc_st[:, 1])
+                          - _corr(ref_st[:, 0], ref_st[:, 1]))
+    except Exception:
+        pass
+    # Side-SNR deficit: 30 dB is "transparent-ish". Anything below
+    # we count the shortfall as penalty.
+    side_snr_deficit_db = max(0.0, 30.0 - side_snr_db)
+
     terms = {
         'hf_bursts_per_10s':   hf_bursts_per_10s,
         'hf_pumping_per_10s':  hf_pumping_per_10s,
@@ -404,6 +450,9 @@ def judge(ref_path, enc_path, label=None):
         'nmr_max_over':        nmr_max_over,
         'onset_fidelity':      onset_fidelity,
         'loudness_delta':      loudness_delta,
+        'side_snr_deficit_db': side_snr_deficit_db,
+        'width_shift_db':      width_shift_db,
+        'lr_corr_shift':       lr_corr_shift,
     }
     breakdown = {}
     score = 0.0
@@ -417,7 +466,7 @@ def judge(ref_path, enc_path, label=None):
             if key in ('hf_bursts_per_10s', 'hf_pumping_per_10s',
                        'hf_holes_per_10s', 'pre_echo_per_10s',
                        'pre_echo_worst_db', 'octave_balance',
-                       'nmr_max_over')
+                       'nmr_max_over', 'side_snr_deficit_db')
             else tol
         )
         excess = max(0.0, terms[key] - tol_source_adjusted)
@@ -461,6 +510,9 @@ def judge(ref_path, enc_path, label=None):
         'context': {
             'overall_snr_db': float(overall_snr),
             'hf_snr_db': hf['hf_snr_db'],
+            'side_snr_db': float(side_snr_db),
+            'width_shift_db': float(width_shift_db),
+            'lr_corr_shift': float(lr_corr_shift),
             'vocal_clarity_ref': float(vc_ref),
             'vocal_clarity_enc': float(vc_enc),
             'octave_deltas_db': {k: float(v[0]) for k, v in deltas.items()},
@@ -479,7 +531,9 @@ def print_report(result):
           f"SFM={result['source_sfm_hf']:.2f}  cliff={result['source_cliff_slope_db']:+.1f} dB  "
           f"tolerance×{result['source_tolerance_mult']:.1f}")
     print(f"{'context':<20s}  overall SNR {result['context']['overall_snr_db']:+.2f} dB · "
-          f"HF SNR {result['context']['hf_snr_db']:+.2f} dB")
+          f"HF SNR {result['context']['hf_snr_db']:+.2f} dB · "
+          f"Side SNR {result['context']['side_snr_db']:+.2f} dB · "
+          f"widthΔ {result['context']['width_shift_db']:+.2f}")
     print('-'*72)
     print(f"{'metric':<24s}  {'value':>7s}  {'tol':>6s}  {'excess':>7s}  {'× w':>5s}  {'contrib':>8s}")
     for key, (w, label, tol) in PEN_WEIGHTS.items():
@@ -517,7 +571,8 @@ def compare(ref_path, enc_paths, labels=None):
           f"SFM={first['source_sfm_hf']:.2f}  cliff={first['source_cliff_slope_db']:+.1f}  "
           f"tolerance×{first['source_tolerance_mult']:.1f}")
     print()
-    print(f"{'rank':<5s} {'label':<20s} {'score':>8s}  {'verdict':<14s} {'SNR':>7s} {'HF-SNR':>7s} {'voc':>6s}  {'hf-art':>7s}")
+    print(f"{'rank':<5s} {'label':<20s} {'score':>8s}  {'verdict':<14s} {'SNR':>7s} {'HF-SNR':>7s} "
+          f"{'Side':>6s} {'widΔ':>5s} {'voc':>6s}  {'hf-art':>7s}")
     for rank, r in enumerate(results_sorted, 1):
         vc_shift = r['breakdown']['vocal_clarity_shift']['value']
         hf_art = (r['breakdown']['hf_bursts_per_10s']['contribution']
@@ -525,6 +580,7 @@ def compare(ref_path, enc_paths, labels=None):
                 + r['breakdown']['hf_holes_per_10s']['contribution'])
         print(f"{rank:<5d} {r['label']:<20s} {r['score']:>7.2f}   {r['verdict']:<14s} "
               f"{r['context']['overall_snr_db']:>+6.1f}  {r['context']['hf_snr_db']:>+6.1f}  "
+              f"{r['context']['side_snr_db']:>+5.1f} {r['context']['width_shift_db']:>+4.2f} "
               f"{vc_shift:>5.2f}  {hf_art:>6.2f}")
     return results_sorted
 

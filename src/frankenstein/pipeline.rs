@@ -16,13 +16,14 @@ use super::{analysis, rdo};
 pub fn build_spectral_unit(
     coefficients: &[f32],
     coding_mode: CodingMode,
-    _options: SearchOptions,
+    options: SearchOptions,
     target_bits: usize,
 ) -> Result<SpectrumEncoding> {
     // ATRAC3 is effectively always 44.1 kHz; keep it parameterised for
     // later tools.
     let sample_rate = 44100u32;
+    let channel_idx = options.channel_idx.min(1);
 
-    let psycho = analysis::compute(coefficients, sample_rate);
+    let psycho = analysis::compute(coefficients, sample_rate, channel_idx);
     rdo::allocate(coefficients, coding_mode, target_bits, &psycho)
 }

@@ -323,7 +323,8 @@ impl PrototypeEncoder {
             target_bits: options.target_bits_per_channel,
             max_candidates_per_band: 64,
             tonal_marked_subbands: [false; 32],
-            use_rdo: false, // Pass 1 = Psycho v2 (warm)
+            use_rdo: false,
+            channel_idx: 0,
         };
 
         // PASS 1: Encode mit Standard-Budget → sammle echte Metriken
@@ -513,7 +514,7 @@ impl PrototypeEncoder {
         let mut frame_channels = Vec::with_capacity(analysis_channels.len());
         let mut frame_writer = BitWriter::new();
 
-        for analysis in analysis_channels {
+        for (channel_idx, analysis) in analysis_channels.iter().enumerate() {
             let gain_payload_bits = analysis
                 .gain_bands
                 .iter()
@@ -663,6 +664,7 @@ impl PrototypeEncoder {
             adjusted_search.target_bits =
                 Some(spectral_budget.saturating_sub(tonal_result.tonal_bits));
             adjusted_search.tonal_marked_subbands = tonal_result.tonal_subbands;
+            adjusted_search.channel_idx = channel_idx;
 
             let mut spectrum = build_spectral_unit(&residual, coding_mode, adjusted_search)?;
             pad_spectral_unit(&mut spectrum, min_subband_count);
