@@ -284,22 +284,26 @@ def source_health(x, sr):
     post_db = 20 * np.log10(np.sqrt(np.mean(post_cliff**2) + 1e-20))
     cliff_slope_db = pre_db - post_db
 
-    # Fusion rule, ordered most-to-least trusted:
-    #  * cliff > 25 dB     → lossy_severe (classic MP3 low-pass)
-    #  * hf_energy < -35   → lossy_severe regardless of SFM
-    #  * hf_energy < -25 and sfm_hf > 0.3 → lossy_mild (flat HF noise)
-    #  * sfm_hf < 0.1      → clean (tonal HF implies real source)
-    #  * otherwise         → fall back on HF energy tier
-    if cliff_slope_db > 25.0 or hf_energy_db < -35.0:
+    # Fusion rule, ordered most-to-least trusted. The cliff is the
+    # smoking gun for a lossy upstream codec — no natural source rolls
+    # off steeper than 25 dB inside a 3-kHz window. An absent cliff
+    # means the HF energy level is a genre artefact, not an encoder
+    # artefact, and the source should be treated as clean.
+    if cliff_slope_db > 25.0:
         cls, tmult = 'lossy_severe', 2.0
-    elif sfm_hf < 0.1 and hf_energy_db > -35.0:
-        # Strongly tonal HF: Electronic / Classical / studio material.
-        # Treat as clean even if the HF RMS is modest.
-        cls, tmult = 'clean', 1.0
-    elif hf_energy_db < -28.0 or sfm_hf > 0.35:
+    elif cliff_slope_db > 15.0 or hf_energy_db < -38.0:
+        # Moderate cliff, or truly empty HF → lossy-mild band.
         cls, tmult = 'lossy_mild', 1.3
-    else:
+    elif cliff_slope_db < 12.0:
+        # Natural roll-off ⇒ clean, irrespective of HF energy level
+        # (Electronic/Classical naturally sit low in 14+ kHz).
         cls, tmult = 'clean', 1.0
+    else:
+        # Ambiguous; defer to the old HF+SFM combination.
+        if hf_energy_db < -30.0 and sfm_hf > 0.25:
+            cls, tmult = 'lossy_mild', 1.3
+        else:
+            cls, tmult = 'clean', 1.0
 
     return {
         'hf_energy_db': float(hf_energy_db),
